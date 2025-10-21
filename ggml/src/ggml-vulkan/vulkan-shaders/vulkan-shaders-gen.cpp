@@ -774,7 +774,7 @@ void process_shaders() {
 #ifdef GGML_VULKAN_BUILD_ADRENO_SHADERS
     std::cout << "ggml_vulkan: Generating Adreno-supported shaders" << std::endl;
 
-    std::vector<std::string> adreno_shader_types = {"f32", "f16", "q4_0", "q4_1", "q6_k", "q8_0"};
+    std::vector<std::string> adreno_shader_types = {"f32", "f16", "q4_0", "q4_k", "q4_1", "q5_k", "q6_k", "q8_0"};
     std::string device_suffix = "adreno_";
     auto adreno_base_dict = merge_maps(base_dict, {{"ADRENO", "1"}});
 
