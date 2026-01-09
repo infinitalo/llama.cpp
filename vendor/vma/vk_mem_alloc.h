@@ -3282,7 +3282,7 @@ If providing your own implementation, you need to implement a subset of std::ato
     #ifdef VMA_DEBUG_ALIGNMENT // Old name
         #define VMA_MIN_ALIGNMENT VMA_DEBUG_ALIGNMENT
     #else
-        #define VMA_MIN_ALIGNMENT (1)
+        #define VMA_MIN_ALIGNMENT (64)
     #endif
 #endif
 
