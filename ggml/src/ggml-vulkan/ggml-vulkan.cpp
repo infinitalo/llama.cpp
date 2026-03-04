@@ -7390,6 +7390,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const uint64_t ne12 = src1->ne[2];
     const uint64_t ne13 = src1->ne[3];
 
+    const uint64_t ne20 = dst->ne[0];
     const uint64_t ne21 = dst->ne[1];
     const uint32_t stride_d = dst->nb[1] / ggml_type_size(dst->type);
     const uint32_t stride_batch_d = stride_d*ne21;
@@ -7491,7 +7492,53 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         to_q8_1 = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
     }
 
+    const uint64_t d_buf_offset = vk_tensor_offset(dst) + dst->view_offs;
+
+    bool do_tiling = ctx->device->architecture == vk_device_architecture::QUALCOMM_ADRENO &&
+        (ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) &&
+        (x_sz + y_sz + d_sz >= ctx->device->tiling_threshold);
+
     {
+        static int tiling_debug_count = 0;
+        if (tiling_debug_count < 20) {
+            tiling_debug_count++;
+            fprintf(stderr, "[TILING_DEBUG] mul_mat: do_tiling=%d, is_adreno=%d, batch1=%d, "
+                "x_sz=%lu, y_sz=%lu, d_sz=%lu, total=%lu, threshold=%lu, "
+                "ne00=%lu, ne01=%lu, ne10=%lu, ne11=%lu, ne02=%lu, ne03=%lu, ne12=%lu, ne13=%lu, "
+                "src0_type=%s, src1_type=%s, qx_needs_dequant=%d, qy_needs_dequant=%d, quantize_y=%d, "
+                "pipeline=%s, split_k=%u, ne20=%lu, stride_d=%u\n",
+                (int)do_tiling,
+                (int)(ctx->device->architecture == vk_device_architecture::QUALCOMM_ADRENO),
+                (int)(ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1),
+                (unsigned long)x_sz, (unsigned long)y_sz, (unsigned long)d_sz,
+                (unsigned long)(x_sz + y_sz + d_sz), (unsigned long)ctx->device->tiling_threshold,
+                (unsigned long)ne00, (unsigned long)ne01, (unsigned long)ne10, (unsigned long)ne11,
+                (unsigned long)ne02, (unsigned long)ne03, (unsigned long)ne12, (unsigned long)ne13,
+                ggml_type_name(src0->type), ggml_type_name(src1->type),
+                (int)qx_needs_dequant, (int)qy_needs_dequant, (int)quantize_y,
+                pipeline->name.c_str(), split_k, (unsigned long)ne20, stride_d);
+        }
+    }
+
+    uint64_t tile_m = 0, tile_n = 0, m_tiles = 0, n_tiles = 0, num_dispatches = 1;
+    if (do_tiling) {
+        GGML_ASSERT(ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1);
+        calculate_tile_dims(ctx, ne01, ne11, ne00, &tile_m, &tile_n, &m_tiles, &n_tiles, &num_dispatches);
+        fprintf(stderr, "[TILING_DEBUG] mul_mat tiling: tile_m=%lu, tile_n=%lu, m_tiles=%lu, n_tiles=%lu, num_dispatches=%lu\n",
+            (unsigned long)tile_m, (unsigned long)tile_n, (unsigned long)m_tiles, (unsigned long)n_tiles, (unsigned long)num_dispatches);
+        VK_LOG_DEBUG("[ggml_vk_mul_mat_q_f16] [tiling] tile_m="
+            << tile_m << ", tile_n=" << tile_n << ", m_tiles=" << m_tiles << ", n_tiles=" << n_tiles
+            << ", num_dispatches=" << num_dispatches);
+    }
+
+    {
+        if (do_tiling) {
+            ctx->prealloc_size_tile = ctx->device->tiling_threshold;
+            GGML_ASSERT(split_k <= 1);
+            if (ctx->prealloc_tile == nullptr || ctx->prealloc_tile->size < ctx->prealloc_size_tile) {
+                ggml_vk_preallocate_buffers(ctx, subctx);
+            }
+        }
         const uint64_t split_k_size = split_k > 1 ? d_sz * split_k : 0;
         if (
                 (qx_needs_dequant && x_sz > ctx->device->properties.limits.maxStorageBufferRange) ||
@@ -7513,7 +7560,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         }
 
         // Request descriptor sets
-        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, num_dispatches);
         if (qx_needs_dequant) {
             ggml_pipeline_request_descriptor_sets(ctx, to_fp16_vk_0, 1);
         }
@@ -7529,7 +7576,6 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     }
 
     vk_buffer d_D = dst_buf_ctx->dev_buffer;
-    const uint64_t d_buf_offset = vk_tensor_offset(dst) + dst->view_offs;
     GGML_ASSERT(d_D != nullptr);
     GGML_ASSERT(d_D->size >= d_buf_offset + d_sz);
     vk_buffer d_X;
@@ -7614,14 +7660,30 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     }
 
     // compute
-    ggml_vk_matmul(
-        ctx, subctx, pipeline,
-        { d_X, x_buf_offset, x_sz }, { d_Y, y_buf_offset, y_sz },
-        ggml_vk_subbuffer(ctx, d_D, d_buf_offset), { ctx->prealloc_split_k, 0, d_sz * split_k },
-        ne01, ne11, ne10,
-        ne10, ne10, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
-        split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n
-    );  // NOLINT
+    if (do_tiling) {
+        ggml_type a_type = qx_needs_dequant ? f16_type : src0->type;
+        ggml_type b_type = quantize_y ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : f16_type);
+        ggml_type d_type = GGML_TYPE_F32;
+
+        GGML_ASSERT(ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1);
+        GGML_ASSERT(split_k <= 1);
+
+        ggml_vk_matmul_tiling(
+            ctx, subctx, pipeline,
+            ne00, ne01, ne10, ne11, ne20,
+            a_type, b_type, d_type, tile_m, tile_n,
+            d_X, x_buf_offset, d_Y, y_buf_offset, d_D, d_buf_offset
+        );
+    } else {
+        ggml_vk_matmul(
+            ctx, subctx, pipeline,
+            { d_X, x_buf_offset, x_sz }, { d_Y, y_buf_offset, y_sz },
+            ggml_vk_subbuffer(ctx, d_D, d_buf_offset), { ctx->prealloc_split_k, 0, d_sz * split_k },
+            ne01, ne11, ne10,
+            ne10, ne10, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
+            split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n
+        );  // NOLINT
+    }
 
     if (x_non_contig || qx_needs_dequant) {
         ctx->prealloc_x_need_sync = true;
