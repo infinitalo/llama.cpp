@@ -7476,6 +7476,9 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         if (do_tiling) {
             ctx->prealloc_size_tile = ctx->device->tiling_threshold;
             GGML_ASSERT(split_k <= 1);
+            if (ctx->prealloc_tile == nullptr || ctx->prealloc_tile->size < ctx->prealloc_size_tile) {
+                ggml_vk_preallocate_buffers(ctx, subctx);
+            }
         }
         const uint64_t split_k_size = split_k > 1 ? d_sz * split_k : 0;
         if (
@@ -10030,6 +10033,11 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             VK_LOG_DEBUG("[out_prod] [tile_and_dispatch] tile_m="
                 << tile_m << ", tile_n=" << tile_n << ", m_tiles=" << m_tiles << ", n_tiles=" << n_tiles
                 << ", num_dispatches=" << num_dispatches);
+
+            ctx->prealloc_size_tile = ctx->device->tiling_threshold;
+            if (ctx->prealloc_tile == nullptr || ctx->prealloc_tile->size < ctx->prealloc_size_tile) {
+                ggml_vk_preallocate_buffers(ctx, subctx);
+            }
 
             auto pc_bin = *reinterpret_cast<const vk_op_binary_push_constants*>(&pc);
 
