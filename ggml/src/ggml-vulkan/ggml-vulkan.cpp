@@ -4691,6 +4691,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
             // despite being able to allocate large buffers, using them for SSBOs cause problems
             // on Adreno GPUs, so we need to tile larger operations.
             device->tiling_threshold = descriptor_buffer_props.descriptorBufferAddressSpaceSize;
+            fprintf(stderr, "[TILING_DEBUG] tiling_threshold = %lu (%.2f MB), descriptor_buffer_address_space = %lu\n",
+                (unsigned long)device->tiling_threshold,
+                (double)device->tiling_threshold / (1024.0 * 1024.0),
+                (unsigned long)descriptor_buffer_props.descriptorBufferAddressSpaceSize);
         }
         device->uma = device->properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
         if (sm_builtins) {
@@ -7135,6 +7139,8 @@ static void ggml_vk_matmul_tiling(ggml_backend_vk_context *ctx, vk_context& subc
     uint32_t d_bytes_per_block = ggml_type_size(d_type);
     uint32_t d_elems_per_block = ggml_blck_size(d_type);
 
+    static int tile_detail_count = 0;
+
     for (uint32_t n0 = 0; n0 < ne11; n0 += tile_n) {
         const uint32_t nt = (uint32_t) std::min(tile_n, ne11 - n0);
         const uint64_t b_off_bytes = y_buf_offset + CEIL_DIV(((uint64_t)n0 * (uint64_t)ne10), b_elems_per_block) * (uint64_t)b_bytes_per_block;
@@ -7148,6 +7154,17 @@ static void ggml_vk_matmul_tiling(ggml_backend_vk_context *ctx, vk_context& subc
         const uint32_t tile_stride_b_elems = (tile_stride_b_bytes / b_bytes_per_block) * b_elems_per_block;
         const uint64_t b_size_bytes = tile_stride_b_bytes * nt;
         const uint64_t b_off = 0;
+
+        if (tile_detail_count < 5) {
+            fprintf(stderr, "[TILING_DEBUG] matmul_tiling: n0=%u, nt=%u, b_off_bytes=%lu, d_off_bytes_n=%lu, "
+                "b_k_bytes=%lu, b_size_bytes=%lu, b_off=%lu, "
+                "prealloc_tile_size=%lu, d_Y_size=%lu, d_D_size=%lu, d_X_size=%lu, "
+                "y_buf_offset=%lu, x_buf_offset=%lu, d_buf_offset=%lu\n",
+                n0, nt, (unsigned long)b_off_bytes, (unsigned long)d_off_bytes_n,
+                (unsigned long)b_k_bytes, (unsigned long)b_size_bytes, (unsigned long)b_off,
+                (unsigned long)ctx->prealloc_tile->size, (unsigned long)d_Y->size, (unsigned long)d_D->size, (unsigned long)d_X->size,
+                (unsigned long)y_buf_offset, (unsigned long)x_buf_offset, (unsigned long)d_buf_offset);
+        }
 
         // copy tile b data to buffer b
         ggml_vk_copy_2d_to_2d(subctx, ctx->prealloc_tile, b_off, d_Y, b_off_bytes, b_k_bytes, nt, orig_stride_b_bytes, tile_stride_b_bytes);
@@ -7175,6 +7192,24 @@ static void ggml_vk_matmul_tiling(ggml_backend_vk_context *ctx, vk_context& subc
 
             GGML_ASSERT(a_size_bytes + b_size_bytes + d_size_bytes < ctx->device->tiling_threshold);
             GGML_ASSERT(d_off + d_size_bytes < ctx->device->tiling_threshold);
+
+            if (tile_detail_count < 5) {
+                tile_detail_count++;
+                fprintf(stderr, "[TILING_DEBUG]   tile m0=%u, mt=%u, a_off_bytes=%lu, d_off_bytes=%lu, "
+                    "a_k_bytes=%lu, a_size_bytes=%lu, d_size_bytes=%lu, "
+                    "a_off=%lu, d_off=%lu, "
+                    "stride_a_elems=%u, stride_b_elems=%u, stride_d_elems=%u, "
+                    "batch_stride_a=%u, batch_stride_b=%u, batch_stride_d=%u, "
+                    "padded_n_tile=%u, dst_copy_row_size=%lu, "
+                    "orig_stride_d_bytes=%lu, tile_stride_d_bytes=%lu\n",
+                    m0, mt, (unsigned long)a_off_bytes, (unsigned long)d_off_bytes,
+                    (unsigned long)a_k_bytes, (unsigned long)a_size_bytes, (unsigned long)d_size_bytes,
+                    (unsigned long)a_off, (unsigned long)d_off,
+                    tile_stride_a_elems, tile_stride_b_elems, tile_stride_d_elems,
+                    tile_stride_a_elems*mt, tile_stride_b_elems*nt, tile_stride_d_elems*nt,
+                    padded_n_tile, (unsigned long)dst_copy_row_size,
+                    (unsigned long)orig_stride_d_bytes, (unsigned long)tile_stride_d_bytes);
+            }
 
             // copy tile a data to buffer a
             ggml_vk_copy_2d_to_2d(subctx, ctx->prealloc_tile, a_off, d_X, a_off_bytes, a_k_bytes, mt, orig_stride_a_bytes, tile_stride_a_bytes);
@@ -7463,10 +7498,34 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         (ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) &&
         (x_sz + y_sz + d_sz >= ctx->device->tiling_threshold);
 
+    {
+        static int tiling_debug_count = 0;
+        if (tiling_debug_count < 20) {
+            tiling_debug_count++;
+            fprintf(stderr, "[TILING_DEBUG] mul_mat: do_tiling=%d, is_adreno=%d, batch1=%d, "
+                "x_sz=%lu, y_sz=%lu, d_sz=%lu, total=%lu, threshold=%lu, "
+                "ne00=%lu, ne01=%lu, ne10=%lu, ne11=%lu, ne02=%lu, ne03=%lu, ne12=%lu, ne13=%lu, "
+                "src0_type=%s, src1_type=%s, qx_needs_dequant=%d, qy_needs_dequant=%d, quantize_y=%d, "
+                "pipeline=%s, split_k=%u, ne20=%lu, stride_d=%u\n",
+                (int)do_tiling,
+                (int)(ctx->device->architecture == vk_device_architecture::QUALCOMM_ADRENO),
+                (int)(ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1),
+                (unsigned long)x_sz, (unsigned long)y_sz, (unsigned long)d_sz,
+                (unsigned long)(x_sz + y_sz + d_sz), (unsigned long)ctx->device->tiling_threshold,
+                (unsigned long)ne00, (unsigned long)ne01, (unsigned long)ne10, (unsigned long)ne11,
+                (unsigned long)ne02, (unsigned long)ne03, (unsigned long)ne12, (unsigned long)ne13,
+                ggml_type_name(src0->type), ggml_type_name(src1->type),
+                (int)qx_needs_dequant, (int)qy_needs_dequant, (int)quantize_y,
+                pipeline->name.c_str(), split_k, (unsigned long)ne20, stride_d);
+        }
+    }
+
     uint64_t tile_m = 0, tile_n = 0, m_tiles = 0, n_tiles = 0, num_dispatches = 1;
     if (do_tiling) {
         GGML_ASSERT(ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1);
         calculate_tile_dims(ctx, ne01, ne11, ne00, &tile_m, &tile_n, &m_tiles, &n_tiles, &num_dispatches);
+        fprintf(stderr, "[TILING_DEBUG] mul_mat tiling: tile_m=%lu, tile_n=%lu, m_tiles=%lu, n_tiles=%lu, num_dispatches=%lu\n",
+            (unsigned long)tile_m, (unsigned long)tile_n, (unsigned long)m_tiles, (unsigned long)n_tiles, (unsigned long)num_dispatches);
         VK_LOG_DEBUG("[ggml_vk_mul_mat_q_f16] [tiling] tile_m="
             << tile_m << ", tile_n=" << tile_n << ", m_tiles=" << m_tiles << ", n_tiles=" << n_tiles
             << ", num_dispatches=" << num_dispatches);
@@ -10025,6 +10084,21 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         bool do_tiling = ctx->device->architecture == vk_device_architecture::QUALCOMM_ADRENO &&
             (ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) &&
             ((ggml_nbytes(src0) + ggml_nbytes(src1) + ggml_nbytes(dst)) >= ctx->device->tiling_threshold);
+
+        {
+            static int out_prod_debug_count = 0;
+            if (out_prod_debug_count < 10) {
+                out_prod_debug_count++;
+                fprintf(stderr, "[TILING_DEBUG] OUT_PROD: do_tiling=%d, "
+                    "src0_bytes=%lu, src1_bytes=%lu, dst_bytes=%lu, total=%lu, threshold=%lu, "
+                    "ne00=%lu, ne01=%lu, ne10=%lu, ne11=%lu\n",
+                    (int)do_tiling,
+                    (unsigned long)ggml_nbytes(src0), (unsigned long)ggml_nbytes(src1), (unsigned long)ggml_nbytes(dst),
+                    (unsigned long)(ggml_nbytes(src0) + ggml_nbytes(src1) + ggml_nbytes(dst)),
+                    (unsigned long)ctx->device->tiling_threshold,
+                    (unsigned long)ne00, (unsigned long)ne01, (unsigned long)ne10, (unsigned long)ne11);
+            }
+        }
 
         if (do_tiling) {
             uint64_t tile_m = 0, tile_n = 0, m_tiles = 0, n_tiles = 0, num_dispatches = 0;
@@ -12671,6 +12745,8 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
             ggml_vk_destroy_buffer(ctx->prealloc_tile);
         }
         ctx->prealloc_tile = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_tile);
+        fprintf(stderr, "[TILING_DEBUG] allocated prealloc_tile: size=%lu (%.2f MB)\n",
+            (unsigned long)ctx->prealloc_tile->size, (double)ctx->prealloc_tile->size / (1024.0 * 1024.0));
     }
 }
 
