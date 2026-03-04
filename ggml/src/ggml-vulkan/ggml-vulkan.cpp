@@ -106,6 +106,10 @@ static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
 
 #define GGML_VK_MAX_NODES 8192
 
+#define MAX_VK_BUFFERS 256
+
+#define MINIMUM_TILE_SIZE 32
+
 #define VK_CHECK(err, msg)                                          \
     do {                                                            \
         vk::Result err_ = (err);                                    \
@@ -535,6 +539,7 @@ struct vk_device_struct {
     uint64_t max_memory_allocation_size;
     uint64_t max_buffer_size;
     uint64_t suballocation_block_size;
+    uint64_t tiling_threshold;
     bool fp16;
     bool bf16;
     bool pipeline_robustness;
@@ -1884,8 +1889,8 @@ struct ggml_backend_vk_context {
 
     size_t semaphore_idx, event_idx;
     ggml_vk_garbage_collector gc;
-    size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset;
-    vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, sync_staging;
+    size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset, prealloc_size_tile;
+    vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, prealloc_tile, sync_staging;
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
@@ -2491,6 +2496,7 @@ static void ggml_vk_command_pool_cleanup(vk_device& device, vk_command_pool& p) 
 
     // Requires command buffers to be done
     device->device.resetCommandPool(p.pool);
+
     p.cmd_buffer_idx = 0;
 }
 
@@ -3760,7 +3766,10 @@ static void ggml_vk_load_shaders(vk_device& device) {
     }
     uint32_t rm_iq = 2 * rm_kq;
 
-    const bool use_subgroups = device->subgroup_arithmetic && device->architecture != vk_device_architecture::AMD_GCN && device->architecture != vk_device_architecture::QUALCOMM_ADRENO;
+    const bool use_subgroups = device->subgroup_arithmetic &&
+        device->architecture != vk_device_architecture::AMD_GCN &&
+        device->architecture != vk_device_architecture::QUALCOMM_ADRENO;
+
     // Ensure a subgroup size >= 16 is available
     const bool use_subgroups16 = use_subgroups && subgroup_min_size_16;
 
@@ -4520,6 +4529,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
         bool fp16_storage = false;
         bool fp16_compute = false;
         bool maintenance4_support = false;
+        bool descriptor_buffer_support = false;
         bool sm_builtins = false;
         bool amd_shader_core_properties2 = false;
         bool pipeline_robustness = false;
@@ -4540,6 +4550,8 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 sm_builtins = true;
             } else if (strcmp("VK_AMD_shader_core_properties2", properties.extensionName) == 0) {
                 amd_shader_core_properties2 = true;
+            } else if (strcmp("VK_EXT_descriptor_buffer", properties.extensionName) == 0) {
+                descriptor_buffer_support = true;
             } else if (strcmp("VK_EXT_pipeline_robustness", properties.extensionName) == 0) {
                 pipeline_robustness = true;
             } else if (strcmp("VK_EXT_subgroup_size_control", properties.extensionName) == 0) {
@@ -4575,6 +4587,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
         vk::PhysicalDeviceProperties2 props2;
         vk::PhysicalDeviceMaintenance3Properties props3;
         vk::PhysicalDeviceMaintenance4Properties props4;
+        vk::PhysicalDeviceDescriptorBufferPropertiesEXT descriptor_buffer_props;
         vk::PhysicalDeviceSubgroupProperties subgroup_props;
         vk::PhysicalDeviceDriverProperties driver_props;
         vk::PhysicalDeviceShaderSMBuiltinsPropertiesNV sm_props;
@@ -4595,6 +4608,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
         if (maintenance4_support) {
             last_struct->pNext = (VkBaseOutStructure *)&props4;
             last_struct = (VkBaseOutStructure *)&props4;
+        }
+        if (descriptor_buffer_support) {
+            last_struct->pNext = (VkBaseOutStructure *)&descriptor_buffer_props;
+            last_struct = (VkBaseOutStructure *)&descriptor_buffer_props;
         }
         if (sm_builtins) {
             last_struct->pNext = (VkBaseOutStructure *)&sm_props;
@@ -4669,6 +4686,16 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         device->subgroup_size = subgroup_props.subgroupSize;
         device->subgroup_size_log2 = uint32_t(log2f(float(device->subgroup_size)));
+        if (descriptor_buffer_support && getenv("GGML_VK_TILING_DISABLE") == nullptr &&
+            device->architecture == vk_device_architecture::QUALCOMM_ADRENO) {
+            // despite being able to allocate large buffers, using them for SSBOs cause problems
+            // on Adreno GPUs, so we need to tile larger operations.
+            device->tiling_threshold = descriptor_buffer_props.descriptorBufferAddressSpaceSize;
+            fprintf(stderr, "[TILING_DEBUG] tiling_threshold = %lu (%.2f MB), descriptor_buffer_address_space = %lu\n",
+                (unsigned long)device->tiling_threshold,
+                (double)device->tiling_threshold / (1024.0 * 1024.0),
+                (unsigned long)descriptor_buffer_props.descriptorBufferAddressSpaceSize);
+        }
         device->uma = device->properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
         if (sm_builtins) {
             device->shader_core_count = sm_props.shaderSMCount;
@@ -5623,6 +5650,7 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->prealloc_size_split_k = 0;
     // Fixed size of 1KB, for deterministic behavior
     ctx->prealloc_size_add_rms_partials = 1024;
+    ctx->prealloc_size_tile = 0;
 
     ctx->fence = ctx->device->device.createFence({});
     ctx->almost_ready_fence = ctx->device->device.createFence({});
@@ -6532,6 +6560,9 @@ static void ggml_vk_buffer_copy_async(vk_context& ctx, vk_buffer& dst, size_t ds
 }
 
 static void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& src, size_t src_offset, size_t size) {
+    VK_LOG_DEBUG("ggml_vk_buffer(" << dst << "dst=" << dst << ", dst_offset=" << dst_offset << ", src="
+            << src << ", src_offset=" << src_offset << ", size=" << size << ")");
+
     if (src->device == dst->device) {
         std::lock_guard<std::recursive_mutex> guard(src->device->mutex);
         VK_LOG_DEBUG("ggml_vk_buffer_copy(SINGLE_DEVICE, " << size << ")");
@@ -6593,6 +6624,12 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
     VK_LOG_DEBUG("ggml_vk_guess_split_k(" << m << ", " << n << ", " << k << ", " << disable_split_k << ")");
 
     if (disable_split_k) {
+        return 1;
+    }
+
+    // disable split_k for large Adreno matrices, since we usually need to do tiling
+    // for those cases and split_k would increase memory requirements
+    if (ctx->device->architecture == vk_device_architecture::QUALCOMM_ADRENO) {
         return 1;
     }
 
@@ -6928,6 +6965,411 @@ static void ggml_vk_quantize_q8_1(ggml_backend_vk_context * ctx, vk_context& sub
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { in, out }, std::array<uint32_t, 1>{ne}, { ne, 1, 1 });
     ggml_vk_sync_buffers(ctx, subctx);
+}
+
+static void ggml_vk_copy_2d_to_2d_post_compute_barrier(vk_context& subctx, vk_buffer& buf, size_t offset, size_t size) {
+    VkBufferMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = (VkBuffer) buf->buffer;
+    barrier.offset = offset;
+    barrier.size = size;
+
+    vkCmdPipelineBarrier(subctx->s->buffer,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 1, &barrier, 0, nullptr);
+}
+
+static void ggml_vk_copy_2d_to_2d_pre_compute_barrier(vk_context& subctx, vk_buffer& buf, size_t offset, size_t size) {
+    VkBufferMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = (VkBuffer) buf->buffer;
+    barrier.offset = offset;
+    barrier.size = size;
+
+    vkCmdPipelineBarrier(subctx->s->buffer,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 0, nullptr, 1, &barrier, 0, nullptr);
+}
+
+static void ggml_vk_copy_2d_to_2d(vk_context& subctx, vk_buffer& dst, size_t dst_offset, vk_buffer& src, size_t src_offset, size_t width, size_t height, size_t spitch, size_t dpitch) {
+    VK_LOG_DEBUG("ggml_vk_copy_2d_to_2d(dst=" << dst << ", dst_offset=" << dst_offset
+            << ", src=" << src << ", src_offset=" << src_offset
+            << ", width=" << width << ", height=" << height
+            << ", spitch=" << spitch << ", dpitch=" << dpitch
+            << ", multi_device=" << (src->device != dst->device) << ")");
+
+    size_t src_total_size = src_offset + (height - 1) * spitch + width;
+    GGML_ASSERT(src_total_size <= src->size && "Source buffer bounds exceeded");
+
+    size_t dst_total_size = dst_offset + (height - 1) * dpitch + width;
+    GGML_ASSERT(dst_total_size <= dst->size && "Destination buffer bounds exceeded");
+
+    // make sure the buffers live on the same device
+    if (src->device != dst->device) {
+        ggml_vk_ensure_sync_staging_buffer(src->device, src_total_size);
+        ggml_vk_ensure_sync_staging_buffer(dst->device, dst_total_size);
+
+        ggml_vk_buffer_copy(src->device->sync_staging, 0, src, src_offset, src_total_size);
+        memcpy(dst->device->sync_staging->info.pMappedData, src->device->sync_staging->info.pMappedData, src_total_size);
+        ggml_vk_copy_2d_to_2d(subctx, dst->device->sync_staging, dst_offset, src->device->sync_staging, 0, width, height, spitch, dpitch);
+        return;
+    }
+
+    GGML_ASSERT(src->device == dst->device);
+
+    std::lock_guard<std::recursive_mutex> guard(src->device->mutex);
+
+    int group_size = dst->device->architecture == vk_device_architecture::QUALCOMM_ADRENO ? 256 : height;
+    int groups = CEIL_DIV(height, group_size);
+
+    for (int i = 0; i < groups; i++) {
+        int group_height = std::min(group_size, (int) height - i * group_size);
+        std::vector<VkBufferCopy> copy_regions;
+        copy_regions.reserve(group_height);
+
+        for (size_t row = i * group_size; row < (size_t) i * group_size + group_height; ++row) {
+            size_t row_src_offset = src_offset + row * spitch;
+            size_t row_dst_offset = dst_offset + row * dpitch;
+
+            VkBufferCopy bc{ row_src_offset, row_dst_offset, width };
+            copy_regions.push_back(bc);
+        }
+        vkCmdCopyBuffer(subctx->s->buffer, (VkBuffer)src->buffer, (VkBuffer)dst->buffer, copy_regions.size(), copy_regions.data());
+
+        ggml_vk_ctx_end(subctx);
+        ggml_vk_submit(subctx, src->device->fence);
+        VK_CHECK(src->device->device.waitForFences({ src->device->fence }, true, UINT64_MAX), "vk wait");
+        src->device->device.resetFences({ src->device->fence });
+        ggml_vk_command_pool_cleanup(src->device, *subctx->p);
+        ggml_vk_ctx_begin(src->device, subctx);
+    }
+}
+
+static uint64_t sum_buffer_sizes(uint64_t m, uint64_t n, uint64_t k, enum ggml_type m_type, enum ggml_type n_type, enum ggml_type d_type) {
+    uint64_t a_size = CEIL_DIV(m*k, ggml_blck_size(m_type)) * ggml_type_size(m_type);
+    uint64_t b_size = CEIL_DIV(n*k, ggml_blck_size(n_type)) * ggml_type_size(n_type);
+    uint64_t d_size = CEIL_DIV(m*n, ggml_blck_size(d_type)) * ggml_type_size(d_type);
+
+    return a_size + b_size + d_size;
+}
+
+// calculates largest tile size for binary m,n,k ops such as MUL_MAT and OUT_PROD
+static void calculate_tile_dims(ggml_backend_vk_context * ctx,
+                                uint64_t m, uint64_t n, uint64_t k,
+                                uint64_t *tile_m, uint64_t *tile_n,
+                                uint64_t *m_tiles,uint64_t *n_tiles,
+                                uint64_t *num_dispatches,
+                                enum ggml_type m_type = GGML_TYPE_F32,
+                                enum ggml_type n_type = GGML_TYPE_F32,
+                                enum ggml_type d_type = GGML_TYPE_F32) {
+    VK_LOG_DEBUG("calculate_tile_dims(m=" << m << ", n=" << n << ", k=" << k
+        << ", m_type=" << ggml_type_name(m_type)
+        << ", n_type=" << ggml_type_name(n_type)
+        << ", d_type=" << ggml_type_name(d_type) << ")");
+
+    // minimum tile size
+    const uint64_t step = MINIMUM_TILE_SIZE;
+
+    // starting tile size
+    uint64_t mt = std::min(step, m);
+    uint64_t nt = std::min(step, n);
+
+    // the minimum tile size might be already too large (if it is, it's likely because of `k`)
+    GGML_ASSERT(sum_buffer_sizes(mt, nt, k, m_type, n_type, d_type) < ctx->device->tiling_threshold);
+
+    while (nt < n || mt < m) {
+        bool nt_stopped = false;
+        bool mt_stopped = false;
+
+        if (nt < n) {
+            uint64_t next_nt = std::min(n, nt + step);
+            if (sum_buffer_sizes(mt, next_nt, k, m_type, n_type, d_type) < ctx->device->tiling_threshold) {
+                nt = next_nt;
+            } else {
+                nt_stopped = true;
+            }
+        }
+
+        if (mt < m) {
+            uint64_t next_mt = std::min(m, mt + step);
+            if (sum_buffer_sizes(next_mt, nt, k, m_type, n_type, d_type) < ctx->device->tiling_threshold) {
+                mt = next_mt;
+            } else {
+                mt_stopped = true;
+            }
+        }
+
+        if ((nt_stopped || nt >= n) && (mt_stopped || mt >= m)) {
+            break;
+        }
+    }
+
+    *tile_m = mt;
+    *tile_n = nt;
+    *m_tiles = CEIL_DIV(m, mt);
+    *n_tiles = CEIL_DIV(n, nt);
+    *num_dispatches = (*m_tiles) * (*n_tiles);
+}
+
+static void ggml_vk_matmul_tiling(ggml_backend_vk_context *ctx, vk_context& subctx, vk_pipeline& pipeline,
+        const uint64_t ne00, const uint64_t ne01, const uint64_t ne10, const uint64_t ne11, const uint64_t ne20,
+        ggml_type a_type, ggml_type b_type, ggml_type d_type, const uint64_t tile_m, const uint64_t tile_n,
+        vk_buffer& d_X, size_t x_buf_offset,
+        vk_buffer& d_Y, size_t y_buf_offset,
+        vk_buffer& d_D, size_t d_buf_offset) {
+    VK_LOG_DEBUG("ggml_vk_matmul_tiling(ne00=" << ne00 << ", ne01=" << ne01 << ", ne10=" << ne10 << ", ne11=" << ne11
+        << ", a_type=" << ggml_type_name(a_type) << ", b_type=" << ggml_type_name(b_type) << ", d_type=" << ggml_type_name(d_type) << ")");
+
+    uint32_t a_bytes_per_block = ggml_type_size(a_type);
+    uint32_t a_elems_per_block = ggml_blck_size(a_type);
+
+    uint32_t b_bytes_per_block = ggml_type_size(b_type);
+    uint32_t b_elems_per_block = ggml_blck_size(b_type);
+
+    uint32_t d_bytes_per_block = ggml_type_size(d_type);
+    uint32_t d_elems_per_block = ggml_blck_size(d_type);
+
+    static int tile_detail_count = 0;
+
+    for (uint32_t n0 = 0; n0 < ne11; n0 += tile_n) {
+        const uint32_t nt = (uint32_t) std::min(tile_n, ne11 - n0);
+        const uint64_t b_off_bytes = y_buf_offset + CEIL_DIV(((uint64_t)n0 * (uint64_t)ne10), b_elems_per_block) * (uint64_t)b_bytes_per_block;
+        const uint64_t d_off_bytes_n = d_buf_offset + CEIL_DIV(((uint64_t)n0 * (uint64_t)ne20), d_elems_per_block) * (uint64_t)d_bytes_per_block;
+
+        const uint32_t padded_n_tile = nt;
+
+        const uint64_t b_k_bytes = CEIL_DIV(ne10, b_elems_per_block) * b_bytes_per_block;
+        const uint64_t orig_stride_b_bytes = b_k_bytes;
+        const uint64_t tile_stride_b_bytes = orig_stride_b_bytes;
+        const uint32_t tile_stride_b_elems = (tile_stride_b_bytes / b_bytes_per_block) * b_elems_per_block;
+        const uint64_t b_size_bytes = tile_stride_b_bytes * nt;
+        const uint64_t b_off = 0;
+
+        if (tile_detail_count < 5) {
+            fprintf(stderr, "[TILING_DEBUG] matmul_tiling: n0=%u, nt=%u, b_off_bytes=%lu, d_off_bytes_n=%lu, "
+                "b_k_bytes=%lu, b_size_bytes=%lu, b_off=%lu, "
+                "prealloc_tile_size=%lu, d_Y_size=%lu, d_D_size=%lu, d_X_size=%lu, "
+                "y_buf_offset=%lu, x_buf_offset=%lu, d_buf_offset=%lu\n",
+                n0, nt, (unsigned long)b_off_bytes, (unsigned long)d_off_bytes_n,
+                (unsigned long)b_k_bytes, (unsigned long)b_size_bytes, (unsigned long)b_off,
+                (unsigned long)ctx->prealloc_tile->size, (unsigned long)d_Y->size, (unsigned long)d_D->size, (unsigned long)d_X->size,
+                (unsigned long)y_buf_offset, (unsigned long)x_buf_offset, (unsigned long)d_buf_offset);
+        }
+
+        // copy tile b data to buffer b
+        ggml_vk_copy_2d_to_2d(subctx, ctx->prealloc_tile, b_off, d_Y, b_off_bytes, b_k_bytes, nt, orig_stride_b_bytes, tile_stride_b_bytes);
+
+        for (uint32_t m0 = 0; m0 < ne01; m0 += tile_m) {
+            const uint32_t mt = (uint32_t) std::min(tile_m, ne01 - m0);
+            const uint64_t a_off_bytes = x_buf_offset + CEIL_DIV(((uint64_t)m0 * (uint64_t)ne00), a_elems_per_block) * (uint64_t)a_bytes_per_block;
+            const uint64_t d_off_bytes = d_off_bytes_n + CEIL_DIV((uint64_t)m0, d_elems_per_block) * (uint64_t)d_bytes_per_block;
+
+            const uint64_t a_k_bytes = CEIL_DIV(ne00, a_elems_per_block) * a_bytes_per_block;
+            const uint64_t orig_stride_a_bytes = a_k_bytes;
+            const uint64_t orig_stride_d_bytes = CEIL_DIV(ne20, d_elems_per_block) * d_bytes_per_block;
+            const uint64_t tile_stride_a_bytes = orig_stride_a_bytes;
+            const uint64_t tile_stride_d_bytes = CEIL_DIV(mt, d_elems_per_block) * d_bytes_per_block;
+
+            const uint32_t tile_stride_a_elems = (tile_stride_a_bytes / a_bytes_per_block) * a_elems_per_block;
+            const uint32_t tile_stride_d_elems = (tile_stride_d_bytes / d_bytes_per_block) * d_elems_per_block;
+            const uint64_t dst_copy_row_size = CEIL_DIV(mt, d_elems_per_block) * d_bytes_per_block;
+
+            const uint64_t a_size_bytes = tile_stride_a_bytes * mt;
+            const uint64_t d_size_bytes = tile_stride_d_bytes * nt;
+
+            const uint64_t a_off = b_off + b_size_bytes;
+            const uint64_t d_off = a_off + a_size_bytes;
+
+            GGML_ASSERT(a_size_bytes + b_size_bytes + d_size_bytes < ctx->device->tiling_threshold);
+            GGML_ASSERT(d_off + d_size_bytes < ctx->device->tiling_threshold);
+
+            if (tile_detail_count < 5) {
+                tile_detail_count++;
+                fprintf(stderr, "[TILING_DEBUG]   tile m0=%u, mt=%u, a_off_bytes=%lu, d_off_bytes=%lu, "
+                    "a_k_bytes=%lu, a_size_bytes=%lu, d_size_bytes=%lu, "
+                    "a_off=%lu, d_off=%lu, "
+                    "stride_a_elems=%u, stride_b_elems=%u, stride_d_elems=%u, "
+                    "batch_stride_a=%u, batch_stride_b=%u, batch_stride_d=%u, "
+                    "padded_n_tile=%u, dst_copy_row_size=%lu, "
+                    "orig_stride_d_bytes=%lu, tile_stride_d_bytes=%lu\n",
+                    m0, mt, (unsigned long)a_off_bytes, (unsigned long)d_off_bytes,
+                    (unsigned long)a_k_bytes, (unsigned long)a_size_bytes, (unsigned long)d_size_bytes,
+                    (unsigned long)a_off, (unsigned long)d_off,
+                    tile_stride_a_elems, tile_stride_b_elems, tile_stride_d_elems,
+                    tile_stride_a_elems*mt, tile_stride_b_elems*nt, tile_stride_d_elems*nt,
+                    padded_n_tile, (unsigned long)dst_copy_row_size,
+                    (unsigned long)orig_stride_d_bytes, (unsigned long)tile_stride_d_bytes);
+            }
+
+            // copy tile a data to buffer a
+            ggml_vk_copy_2d_to_2d(subctx, ctx->prealloc_tile, a_off, d_X, a_off_bytes, a_k_bytes, mt, orig_stride_a_bytes, tile_stride_a_bytes);
+            ggml_vk_copy_2d_to_2d_pre_compute_barrier(subctx, ctx->prealloc_tile, 0, a_size_bytes + b_size_bytes);
+
+            // call matmul for the tile
+            ggml_vk_matmul(
+                ctx, subctx, pipeline,
+                { ctx->prealloc_tile, a_off, a_size_bytes }, { ctx->prealloc_tile, b_off, b_size_bytes },
+                { ctx->prealloc_tile, d_off, d_size_bytes }, { nullptr, 0, 0 },
+                mt, nt, (uint32_t)ne00,
+                tile_stride_a_elems, tile_stride_b_elems, tile_stride_d_elems,
+                tile_stride_a_elems*mt, tile_stride_b_elems*nt, tile_stride_d_elems*nt,
+                1u, 1u, 1u, 1u, 1u, 1u, padded_n_tile
+            );
+
+            // copy results back to dst buffer
+            ggml_vk_copy_2d_to_2d_post_compute_barrier(subctx, ctx->prealloc_tile, d_off, d_size_bytes);
+            ggml_vk_copy_2d_to_2d(subctx, d_D, d_off_bytes, ctx->prealloc_tile, d_off, dst_copy_row_size, nt, tile_stride_d_bytes, orig_stride_d_bytes);
+
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+    }
+}
+
+static void ggml_vk_out_prod_tiling(
+        ggml_backend_vk_context *ctx, vk_context& subctx, vk_pipeline& pipeline, vk_op_binary_push_constants pc,
+        const uint64_t ne00, const uint64_t ne01, const uint64_t ne10, const uint64_t ne11, const uint64_t ned0,
+        ggml_type a_type, ggml_type b_type, ggml_type d_type, const uint64_t tile_m, const uint64_t tile_n,
+        vk_buffer& d_X, size_t x_buf_offset,
+        vk_buffer& d_Y, size_t y_buf_offset,
+        vk_buffer& d_D, size_t d_buf_offset,
+        bool src1_transposed, uint64_t num_elements) {
+    VK_LOG_DEBUG("ggml_vk_out_prod_tiling(ne00=" << ne00 << ", ne01=" << ne01 << ", ne10=" << ne10 << ", ne11=" << ne11
+        << ", a_type=" << ggml_type_name(a_type) << ", b_type=" << ggml_type_name(b_type) << ", d_type=" << ggml_type_name(d_type)
+        << ", tile_m=" << tile_m << ", tile_n=" << tile_n << ")");
+
+    uint32_t a_bytes_per_block = ggml_type_size(a_type);
+    uint32_t a_elems_per_block = ggml_blck_size(a_type);
+
+    uint32_t b_bytes_per_block = ggml_type_size(b_type);
+    uint32_t b_elems_per_block = ggml_blck_size(b_type);
+
+    uint32_t d_bytes_per_block = ggml_type_size(d_type);
+    uint32_t d_elems_per_block = ggml_blck_size(d_type);
+
+    for (uint32_t n0 = 0; n0 < ne10; n0 += tile_n) {
+        const uint32_t nt = (uint32_t) std::min(tile_n, ne10 - n0);
+
+        uint64_t b_off_bytes;
+        if (src1_transposed) {
+            b_off_bytes = y_buf_offset + ((uint64_t)(n0 * ne11) / b_elems_per_block) * (uint64_t)b_bytes_per_block;
+        } else {
+            b_off_bytes = y_buf_offset + ((uint64_t)n0 / b_elems_per_block) * (uint64_t)b_bytes_per_block;
+        }
+        const uint64_t d_off_bytes_n = d_buf_offset + CEIL_DIV(((uint64_t)n0 * (uint64_t)ned0), d_elems_per_block) * (uint64_t)d_bytes_per_block;
+
+        const uint64_t b_off = 0;
+        uint64_t orig_stride_b_bytes;
+        uint64_t tile_stride_b_bytes;
+        uint64_t b_nt_bytes;
+        uint64_t b_size;
+        if (src1_transposed) {
+            orig_stride_b_bytes = CEIL_DIV(ne11, b_elems_per_block) * b_bytes_per_block;
+            tile_stride_b_bytes = orig_stride_b_bytes;
+            b_nt_bytes = orig_stride_b_bytes;
+            b_size = tile_stride_b_bytes * nt;
+        } else {
+            orig_stride_b_bytes = CEIL_DIV(ne10, b_elems_per_block) * b_bytes_per_block;
+            tile_stride_b_bytes = CEIL_DIV(nt, b_elems_per_block) * b_bytes_per_block;
+            b_nt_bytes = CEIL_DIV(nt, b_elems_per_block) * b_bytes_per_block;
+            b_size = tile_stride_b_bytes * ne11;
+        }
+        const size_t b_height = src1_transposed ? nt : ne11;
+
+        // copy b tile
+        ggml_vk_copy_2d_to_2d(subctx, ctx->prealloc_tile, b_off, d_Y, b_off_bytes, b_nt_bytes, b_height, orig_stride_b_bytes, tile_stride_b_bytes);
+
+        for (uint32_t m0 = 0; m0 < ne00; m0 += tile_m) {
+            const uint32_t mt = (uint32_t) std::min(tile_m, ne00 - m0);
+            uint64_t a_off_bytes = x_buf_offset + ((uint64_t)m0 / a_elems_per_block) * (uint64_t)a_bytes_per_block;
+            uint64_t d_off_bytes = d_off_bytes_n + CEIL_DIV((uint64_t)m0, d_elems_per_block) * (uint64_t)d_bytes_per_block;
+
+            const uint64_t orig_stride_a_bytes = CEIL_DIV(ne00, a_elems_per_block) * a_bytes_per_block;
+            const uint64_t orig_stride_d_bytes = CEIL_DIV(ned0, d_elems_per_block) * d_bytes_per_block;
+
+            const uint64_t tile_stride_a_bytes = CEIL_DIV(mt, a_elems_per_block) * a_bytes_per_block;
+            const uint64_t tile_stride_d_bytes = CEIL_DIV(mt, d_elems_per_block) * d_bytes_per_block;
+
+            const uint64_t a_mt_bytes = CEIL_DIV(mt, a_elems_per_block) * a_bytes_per_block;
+
+            const uint64_t a_size = tile_stride_a_bytes * ne01;
+            const uint64_t d_size = tile_stride_d_bytes * nt;
+            const uint64_t a_off = b_size;
+            const uint64_t d_off = a_size + b_size;
+
+            const uint64_t dst_copy_row_size = CEIL_DIV(mt, d_elems_per_block) * d_bytes_per_block;
+
+            GGML_ASSERT(a_size + b_size + d_size < ctx->device->tiling_threshold);
+            GGML_ASSERT(d_off + d_size < ctx->device->tiling_threshold);
+
+            GGML_ASSERT(ne01 == ne11);
+
+            // copy a tile
+            ggml_vk_copy_2d_to_2d(subctx, ctx->prealloc_tile, a_off, d_X, a_off_bytes, a_mt_bytes, ne01, orig_stride_a_bytes, tile_stride_a_bytes);
+
+            std::array<uint32_t, 3> elements;
+
+            uint32_t ne = std::min((uint32_t) num_elements, mt * nt);
+            if (ne > 262144) {
+                elements = { 512, 512, CEIL_DIV(ne, 262144) };
+            } else if (ne > 512) {
+                elements = { 512, CEIL_DIV(ne, 512), 1 };
+            } else {
+                elements = { ne, 1, 1 };
+            }
+
+            // update push constants
+
+            // num elements in tile
+            pc.ne = mt * nt;
+
+            // src0 (a)
+            pc.ne00 = mt; pc.ne01 = ne01;
+            pc.nb00 = pc.nb00;
+            pc.nb01 = mt / a_elems_per_block;
+            pc.nb02 = pc.nb01 * pc.ne01;
+            pc.nb03 = pc.nb02 * pc.ne02;
+
+            // src1 (b)
+            pc.ne10 = nt; pc.ne11 = ne11;
+            if (src1_transposed) {
+                pc.nb10 = pc.nb11 * pc.ne11;
+            } else {
+                pc.nb11 = pc.nb10 * pc.ne10;
+            }
+            pc.nb12 = pc.nb11 * pc.ne11;
+            pc.nb13 = pc.nb12 * pc.ne12;
+
+            // dst (d)
+            pc.ne20 = mt; pc.ne21 = nt;
+            pc.nb20 = pc.nb20;
+            pc.nb21 = pc.nb20 * pc.ne20;
+            pc.nb22 = pc.nb21 * pc.ne21;
+            pc.nb23 = pc.nb22 * pc.ne22;
+
+            ggml_vk_copy_2d_to_2d_pre_compute_barrier(subctx, ctx->prealloc_tile, 0, a_size + b_size);
+
+            vk_subbuffer a = { ctx->prealloc_tile, a_off, a_size };
+            vk_subbuffer b = { ctx->prealloc_tile, b_off, b_size };
+            vk_subbuffer d = { ctx->prealloc_tile, d_off, d_size };
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d }, pc, elements);
+
+            // Copy results back to dst buffer
+            ggml_vk_copy_2d_to_2d_post_compute_barrier(subctx, ctx->prealloc_tile, d_off, d_size);
+            ggml_vk_copy_2d_to_2d(subctx, d_D, d_off_bytes, ctx->prealloc_tile, d_off, dst_copy_row_size, nt, tile_stride_d_bytes, orig_stride_d_bytes);
+
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+    }
 }
 
 static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k) {
@@ -12186,6 +12628,16 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
         }
         ctx->prealloc_add_rms_partials = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_add_rms_partials);
     }
+    if (ctx->prealloc_tile == nullptr || (ctx->prealloc_size_tile > 0 && ctx->prealloc_tile->size < ctx->prealloc_size_tile)) {
+        VK_LOG_MEMORY("ggml_vk_preallocate_buffers(tile_size: " << ctx->prealloc_size_tile << ")");
+        // Resize buffer
+        if (ctx->prealloc_tile != nullptr) {
+            ggml_vk_destroy_buffer(ctx->prealloc_tile);
+        }
+        ctx->prealloc_tile = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_tile);
+        fprintf(stderr, "[TILING_DEBUG] allocated prealloc_tile: size=%lu (%.2f MB)\n",
+            (unsigned long)ctx->prealloc_tile->size, (double)ctx->prealloc_tile->size / (1024.0 * 1024.0));
+    }
 }
 
 static void ggml_vk_compute_forward(ggml_backend_vk_context* ctx, ggml_cgraph * cgraph, ggml_tensor* tensor, int tensor_idx, bool almost_ready);
@@ -12792,6 +13244,7 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ggml_vk_destroy_buffer(ctx->prealloc_split_k);
     ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials);
     ggml_vk_destroy_buffer(ctx->sync_staging);
+    ggml_vk_destroy_buffer(ctx->prealloc_tile);
 
     ctx->prealloc_y_last_pipeline_used = nullptr;
 
