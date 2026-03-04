@@ -4691,10 +4691,6 @@ static vk_device ggml_vk_get_device(size_t idx) {
             // despite being able to allocate large buffers, using them for SSBOs cause problems
             // on Adreno GPUs, so we need to tile larger operations.
             device->tiling_threshold = descriptor_buffer_props.descriptorBufferAddressSpaceSize;
-            fprintf(stderr, "[TILING_DEBUG] tiling_threshold = %lu (%.2f MB), descriptor_buffer_address_space = %lu\n",
-                (unsigned long)device->tiling_threshold,
-                (double)device->tiling_threshold / (1024.0 * 1024.0),
-                (unsigned long)descriptor_buffer_props.descriptorBufferAddressSpaceSize);
         }
         device->uma = device->properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
         if (sm_builtins) {
@@ -7063,7 +7059,7 @@ static uint64_t sum_buffer_sizes(uint64_t m, uint64_t n, uint64_t k, enum ggml_t
     return a_size + b_size + d_size;
 }
 
-// calculates largest tile size for binary m,n,k ops such as MUL_MAT and OUT_PROD
+// calculates largest tile size for binary m,n,k ops such as MUL_MAT
 static void calculate_tile_dims(ggml_backend_vk_context * ctx,
                                 uint64_t m, uint64_t n, uint64_t k,
                                 uint64_t *tile_m, uint64_t *tile_n,
@@ -7228,143 +7224,6 @@ static void ggml_vk_matmul_tiling(ggml_backend_vk_context *ctx, vk_context& subc
 
             // copy results back to dst buffer
             ggml_vk_copy_2d_to_2d_post_compute_barrier(subctx, ctx->prealloc_tile, d_off, d_size_bytes);
-            ggml_vk_copy_2d_to_2d(subctx, d_D, d_off_bytes, ctx->prealloc_tile, d_off, dst_copy_row_size, nt, tile_stride_d_bytes, orig_stride_d_bytes);
-
-            ggml_vk_sync_buffers(ctx, subctx);
-        }
-    }
-}
-
-static void ggml_vk_out_prod_tiling(
-        ggml_backend_vk_context *ctx, vk_context& subctx, vk_pipeline& pipeline, vk_op_binary_push_constants pc,
-        const uint64_t ne00, const uint64_t ne01, const uint64_t ne10, const uint64_t ne11, const uint64_t ned0,
-        ggml_type a_type, ggml_type b_type, ggml_type d_type, const uint64_t tile_m, const uint64_t tile_n,
-        vk_buffer& d_X, size_t x_buf_offset,
-        vk_buffer& d_Y, size_t y_buf_offset,
-        vk_buffer& d_D, size_t d_buf_offset,
-        bool src1_transposed, uint64_t num_elements) {
-    VK_LOG_DEBUG("ggml_vk_out_prod_tiling(ne00=" << ne00 << ", ne01=" << ne01 << ", ne10=" << ne10 << ", ne11=" << ne11
-        << ", a_type=" << ggml_type_name(a_type) << ", b_type=" << ggml_type_name(b_type) << ", d_type=" << ggml_type_name(d_type)
-        << ", tile_m=" << tile_m << ", tile_n=" << tile_n << ")");
-
-    uint32_t a_bytes_per_block = ggml_type_size(a_type);
-    uint32_t a_elems_per_block = ggml_blck_size(a_type);
-
-    uint32_t b_bytes_per_block = ggml_type_size(b_type);
-    uint32_t b_elems_per_block = ggml_blck_size(b_type);
-
-    uint32_t d_bytes_per_block = ggml_type_size(d_type);
-    uint32_t d_elems_per_block = ggml_blck_size(d_type);
-
-    for (uint32_t n0 = 0; n0 < ne10; n0 += tile_n) {
-        const uint32_t nt = (uint32_t) std::min(tile_n, ne10 - n0);
-
-        uint64_t b_off_bytes;
-        if (src1_transposed) {
-            b_off_bytes = y_buf_offset + ((uint64_t)(n0 * ne11) / b_elems_per_block) * (uint64_t)b_bytes_per_block;
-        } else {
-            b_off_bytes = y_buf_offset + ((uint64_t)n0 / b_elems_per_block) * (uint64_t)b_bytes_per_block;
-        }
-        const uint64_t d_off_bytes_n = d_buf_offset + CEIL_DIV(((uint64_t)n0 * (uint64_t)ned0), d_elems_per_block) * (uint64_t)d_bytes_per_block;
-
-        const uint64_t b_off = 0;
-        uint64_t orig_stride_b_bytes;
-        uint64_t tile_stride_b_bytes;
-        uint64_t b_nt_bytes;
-        uint64_t b_size;
-        if (src1_transposed) {
-            orig_stride_b_bytes = CEIL_DIV(ne11, b_elems_per_block) * b_bytes_per_block;
-            tile_stride_b_bytes = orig_stride_b_bytes;
-            b_nt_bytes = orig_stride_b_bytes;
-            b_size = tile_stride_b_bytes * nt;
-        } else {
-            orig_stride_b_bytes = CEIL_DIV(ne10, b_elems_per_block) * b_bytes_per_block;
-            tile_stride_b_bytes = CEIL_DIV(nt, b_elems_per_block) * b_bytes_per_block;
-            b_nt_bytes = CEIL_DIV(nt, b_elems_per_block) * b_bytes_per_block;
-            b_size = tile_stride_b_bytes * ne11;
-        }
-        const size_t b_height = src1_transposed ? nt : ne11;
-
-        // copy b tile
-        ggml_vk_copy_2d_to_2d(subctx, ctx->prealloc_tile, b_off, d_Y, b_off_bytes, b_nt_bytes, b_height, orig_stride_b_bytes, tile_stride_b_bytes);
-
-        for (uint32_t m0 = 0; m0 < ne00; m0 += tile_m) {
-            const uint32_t mt = (uint32_t) std::min(tile_m, ne00 - m0);
-            uint64_t a_off_bytes = x_buf_offset + ((uint64_t)m0 / a_elems_per_block) * (uint64_t)a_bytes_per_block;
-            uint64_t d_off_bytes = d_off_bytes_n + CEIL_DIV((uint64_t)m0, d_elems_per_block) * (uint64_t)d_bytes_per_block;
-
-            const uint64_t orig_stride_a_bytes = CEIL_DIV(ne00, a_elems_per_block) * a_bytes_per_block;
-            const uint64_t orig_stride_d_bytes = CEIL_DIV(ned0, d_elems_per_block) * d_bytes_per_block;
-
-            const uint64_t tile_stride_a_bytes = CEIL_DIV(mt, a_elems_per_block) * a_bytes_per_block;
-            const uint64_t tile_stride_d_bytes = CEIL_DIV(mt, d_elems_per_block) * d_bytes_per_block;
-
-            const uint64_t a_mt_bytes = CEIL_DIV(mt, a_elems_per_block) * a_bytes_per_block;
-
-            const uint64_t a_size = tile_stride_a_bytes * ne01;
-            const uint64_t d_size = tile_stride_d_bytes * nt;
-            const uint64_t a_off = b_size;
-            const uint64_t d_off = a_size + b_size;
-
-            const uint64_t dst_copy_row_size = CEIL_DIV(mt, d_elems_per_block) * d_bytes_per_block;
-
-            GGML_ASSERT(a_size + b_size + d_size < ctx->device->tiling_threshold);
-            GGML_ASSERT(d_off + d_size < ctx->device->tiling_threshold);
-
-            GGML_ASSERT(ne01 == ne11);
-
-            // copy a tile
-            ggml_vk_copy_2d_to_2d(subctx, ctx->prealloc_tile, a_off, d_X, a_off_bytes, a_mt_bytes, ne01, orig_stride_a_bytes, tile_stride_a_bytes);
-
-            std::array<uint32_t, 3> elements;
-
-            uint32_t ne = std::min((uint32_t) num_elements, mt * nt);
-            if (ne > 262144) {
-                elements = { 512, 512, CEIL_DIV(ne, 262144) };
-            } else if (ne > 512) {
-                elements = { 512, CEIL_DIV(ne, 512), 1 };
-            } else {
-                elements = { ne, 1, 1 };
-            }
-
-            // update push constants
-
-            // num elements in tile
-            pc.ne = mt * nt;
-
-            // src0 (a)
-            pc.ne00 = mt; pc.ne01 = ne01;
-            pc.nb00 = pc.nb00;
-            pc.nb01 = mt / a_elems_per_block;
-            pc.nb02 = pc.nb01 * pc.ne01;
-            pc.nb03 = pc.nb02 * pc.ne02;
-
-            // src1 (b)
-            pc.ne10 = nt; pc.ne11 = ne11;
-            if (src1_transposed) {
-                pc.nb10 = pc.nb11 * pc.ne11;
-            } else {
-                pc.nb11 = pc.nb10 * pc.ne10;
-            }
-            pc.nb12 = pc.nb11 * pc.ne11;
-            pc.nb13 = pc.nb12 * pc.ne12;
-
-            // dst (d)
-            pc.ne20 = mt; pc.ne21 = nt;
-            pc.nb20 = pc.nb20;
-            pc.nb21 = pc.nb20 * pc.ne20;
-            pc.nb22 = pc.nb21 * pc.ne21;
-            pc.nb23 = pc.nb22 * pc.ne22;
-
-            ggml_vk_copy_2d_to_2d_pre_compute_barrier(subctx, ctx->prealloc_tile, 0, a_size + b_size);
-
-            vk_subbuffer a = { ctx->prealloc_tile, a_off, a_size };
-            vk_subbuffer b = { ctx->prealloc_tile, b_off, b_size };
-            vk_subbuffer d = { ctx->prealloc_tile, d_off, d_size };
-            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d }, pc, elements);
-
-            // Copy results back to dst buffer
-            ggml_vk_copy_2d_to_2d_post_compute_barrier(subctx, ctx->prealloc_tile, d_off, d_size);
             ggml_vk_copy_2d_to_2d(subctx, d_D, d_off_bytes, ctx->prealloc_tile, d_off, dst_copy_row_size, nt, tile_stride_d_bytes, orig_stride_d_bytes);
 
             ggml_vk_sync_buffers(ctx, subctx);
@@ -9814,11 +9673,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         GGML_ABORT("fatal error");
     }
 
-    if (op == GGML_OP_OUT_PROD) {
-        ggml_vk_out_prod_request_descriptors(ctx, pipeline, src0, src1, dst);
-    } else {
-        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
-    }
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     vk_subbuffer src0_buf = ggml_vk_tensor_subbuffer(ctx, src0, true);
     vk_subbuffer src1_buf = use_src1 ? ggml_vk_tensor_subbuffer(ctx, src1, true) : vk_subbuffer{};
@@ -10080,49 +9935,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         break;
     }
 
-    if (op == GGML_OP_OUT_PROD) {
-        bool do_tiling = ctx->device->architecture == vk_device_architecture::QUALCOMM_ADRENO &&
-            (ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) &&
-            ((ggml_nbytes(src0) + ggml_nbytes(src1) + ggml_nbytes(dst)) >= ctx->device->tiling_threshold);
-
-        {
-            static int out_prod_debug_count = 0;
-            if (out_prod_debug_count < 10) {
-                out_prod_debug_count++;
-                fprintf(stderr, "[TILING_DEBUG] OUT_PROD: do_tiling=%d, "
-                    "src0_bytes=%lu, src1_bytes=%lu, dst_bytes=%lu, total=%lu, threshold=%lu, "
-                    "ne00=%lu, ne01=%lu, ne10=%lu, ne11=%lu\n",
-                    (int)do_tiling,
-                    (unsigned long)ggml_nbytes(src0), (unsigned long)ggml_nbytes(src1), (unsigned long)ggml_nbytes(dst),
-                    (unsigned long)(ggml_nbytes(src0) + ggml_nbytes(src1) + ggml_nbytes(dst)),
-                    (unsigned long)ctx->device->tiling_threshold,
-                    (unsigned long)ne00, (unsigned long)ne01, (unsigned long)ne10, (unsigned long)ne11);
-            }
-        }
-
-        if (do_tiling) {
-            uint64_t tile_m = 0, tile_n = 0, m_tiles = 0, n_tiles = 0, num_dispatches = 0;
-
-            calculate_tile_dims(ctx, ne00, ne10, ne01, &tile_m, &tile_n, &m_tiles, &n_tiles, &num_dispatches, src0->type);
-            VK_LOG_DEBUG("[out_prod] [tile_and_dispatch] tile_m="
-                << tile_m << ", tile_n=" << tile_n << ", m_tiles=" << m_tiles << ", n_tiles=" << n_tiles
-                << ", num_dispatches=" << num_dispatches);
-
-            ctx->prealloc_size_tile = ctx->device->tiling_threshold;
-            if (ctx->prealloc_tile == nullptr || ctx->prealloc_tile->size < ctx->prealloc_size_tile) {
-                ggml_vk_preallocate_buffers(ctx, subctx);
-            }
-
-            auto pc_bin = *reinterpret_cast<const vk_op_binary_push_constants*>(&pc);
-
-            ggml_vk_out_prod_tiling(ctx, subctx, pipeline, pc_bin, ne00, ne01, ne10, ne11, dst->ne[0],
-                src0->type, src1->type, dst->type, tile_m, tile_n,
-                src0_buf.buffer, src0_buf.offset, src1_buf.buffer, src1_buf.offset, dst_buf.buffer, dst_buf.offset,
-                ggml_is_transposed(src1), ggml_nelements(dst));
-        } else {
-            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
-        }
-    } else if (op == GGML_OP_ADD || op == GGML_OP_RMS_NORM) {
+    if (op == GGML_OP_ADD || op == GGML_OP_RMS_NORM) {
         vk_subbuffer a_buf = src0_buf;
         if (ctx->do_add_rms_partials) {
             a_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_add_rms_partials, ctx->prealloc_size_add_rms_partials_offset);
@@ -12745,45 +12558,11 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
             ggml_vk_destroy_buffer(ctx->prealloc_tile);
         }
         ctx->prealloc_tile = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_tile);
-        fprintf(stderr, "[TILING_DEBUG] allocated prealloc_tile: size=%lu (%.2f MB)\n",
-            (unsigned long)ctx->prealloc_tile->size, (double)ctx->prealloc_tile->size / (1024.0 * 1024.0));
     }
 }
 
-static void ggml_vk_out_prod_request_descriptors(ggml_backend_vk_context* ctx, vk_pipeline pipeline, const ggml_tensor* src0, const ggml_tensor* src1, const ggml_tensor* dst) {
-    const uint64_t ne00 = src0->ne[0];
-    const uint64_t ne01 = src0->ne[1];
-    const uint64_t ne02 = src0->ne[2];
-    const uint64_t ne03 = src0->ne[3];
-    const uint64_t ne0 = ne00 * ne01;
-
-    const uint64_t ne10 = src1->ne[0];
-    const uint64_t ne11 = src1->ne[1];
-    const uint64_t ne12 = src1->ne[2];
-    const uint64_t ne13 = src1->ne[3];
-    const uint64_t ne1 = ne10 * ne11;
-
-    const uint64_t ned0 = dst->ne[0];
-    const uint64_t ned1 = dst->ne[1];
-    const uint64_t ned = ned0 * ned1;
-
-    uint64_t x_sz = CEIL_DIV(ne0, ggml_blck_size(src0->type)) * ggml_type_size(src0->type);
-    uint64_t y_sz = ggml_type_size(src1->type) * ne1;
-    uint64_t d_sz = ggml_type_size(dst->type) * ned;
-
-    bool do_tiling =
-        ctx->device->architecture == vk_device_architecture::QUALCOMM_ADRENO &&
-        (ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) &&
-        (x_sz + y_sz + d_sz >= ctx->device->tiling_threshold);
-
-    uint64_t tile_m = 0, tile_n = 0, m_tiles = 0, n_tiles = 0, num_dispatches = 1;
-    if (do_tiling) {
-        calculate_tile_dims(ctx, ne00, ne10, ne01, &tile_m, &tile_n, &m_tiles, &n_tiles, &num_dispatches, src0->type);
-        VK_LOG_DEBUG("[out_prod] [request_descriptor_sets] tile_m=" << tile_m << ", tile_n=" << tile_n
-            << ", m_tiles=" << m_tiles << ", n_tiles=" << n_tiles << ", num_dispatches=" << num_dispatches << "\n");
-        ctx->prealloc_size_tile = ctx->device->tiling_threshold;
-    }
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, num_dispatches);
+static void ggml_vk_out_prod_request_descriptors(ggml_backend_vk_context* ctx, vk_pipeline pipeline, const ggml_tensor*, const ggml_tensor*, const ggml_tensor*) {
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 }
 
 static void ggml_vk_compute_forward(ggml_backend_vk_context* ctx, ggml_cgraph * cgraph, ggml_tensor* tensor, int tensor_idx, bool almost_ready);
@@ -13325,6 +13104,7 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
 
 #ifdef GGML_VULKAN_CHECK_RESULTS
         ggml_vk_synchronize(ctx);
+        ctx->device->device.waitIdle();
         ggml_vk_check_results_1(ctx, cgraph, tensor_idx);
 #endif
     }
@@ -14269,7 +14049,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             total_mul_mat_bytes += bytes;
         }
 
-        if (!ctx->device->disable_fusion) {
+        if (!ctx->device->disable_fusion
+#ifdef GGML_VULKAN_CHECK_RESULTS
+            && false
+#endif
+        ) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
             if (num_adds) {
                 ctx->num_additional_fused_ops = num_adds - 1;
@@ -15106,8 +14890,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     return true;
                 }
 
-                if (
-                    (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_I32) ||
+                if ((src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_I32) ||
                     (src0_type == GGML_TYPE_I32 && src1_type == GGML_TYPE_F32)
                 ) {
                     return true;
@@ -15737,6 +15520,8 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             if (vk_output_tensor > 0 && vk_output_tensor == check_counter) {
                 ggml_vk_print_tensor(srci, srci_name[i]);
             }
+
+            cloned_tensors[srci] = srci_clone;
         }
 
         if (tensor->op == GGML_OP_FLASH_ATTN_EXT) {
