@@ -13325,6 +13325,7 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
 
 #ifdef GGML_VULKAN_CHECK_RESULTS
         ggml_vk_synchronize(ctx);
+        ctx->device->device.waitIdle();
         ggml_vk_check_results_1(ctx, cgraph, tensor_idx);
 #endif
     }
@@ -14269,7 +14270,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             total_mul_mat_bytes += bytes;
         }
 
-        if (!ctx->device->disable_fusion) {
+        if (!ctx->device->disable_fusion
+#ifdef GGML_VULKAN_CHECK_RESULTS
+            && false
+#endif
+        ) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
             if (num_adds) {
                 ctx->num_additional_fused_ops = num_adds - 1;
@@ -15106,8 +15111,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     return true;
                 }
 
-                if (
-                    (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_I32) ||
+                if ((src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_I32) ||
                     (src0_type == GGML_TYPE_I32 && src1_type == GGML_TYPE_F32)
                 ) {
                     return true;
@@ -15737,6 +15741,8 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             if (vk_output_tensor > 0 && vk_output_tensor == check_counter) {
                 ggml_vk_print_tensor(srci, srci_name[i]);
             }
+
+            cloned_tensors[srci] = srci_clone;
         }
 
         if (tensor->op == GGML_OP_FLASH_ATTN_EXT) {
