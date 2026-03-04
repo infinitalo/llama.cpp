@@ -10060,10 +10060,12 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
         }
     } else if (op == GGML_OP_ADD || op == GGML_OP_RMS_NORM) {
-        vk_buffer d_A = ctx->do_add_rms_partials ? ctx->prealloc_add_rms_partials : src0_buf.buffer;
-        size_t a_buf_offset = ctx->do_add_rms_partials ? ctx->prealloc_size_add_rms_partials_offset : src0_buf.offset;
+        vk_subbuffer a_buf = src0_buf;
+        if (ctx->do_add_rms_partials) {
+            a_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_add_rms_partials, ctx->prealloc_size_add_rms_partials_offset);
+        }
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-            { src0_buf, src1_buf, dst_buf, vk_subbuffer{ d_A, a_buf_offset, VK_WHOLE_SIZE } }, pc, elements);
+            { src0_buf, src1_buf, dst_buf, a_buf }, pc, elements);
     } else if (op == GGML_OP_GLU) {
         // Empty src1 is possible in glu, but the shader needs a buffer
         vk_subbuffer subbuf1 = use_src1 ? src1_buf : src0_buf;
