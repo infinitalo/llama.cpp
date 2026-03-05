@@ -10171,20 +10171,44 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             if (tile_mode < 0) {
                 const char *env = getenv("GGML_VK_OUT_PROD_TILE_MODE");
                 tile_mode = env ? atoi(env) : 0;
-                fprintf(stderr, "[OUT_PROD_DIAG] tile_mode=%d (0=bypass, 1=single_tile, 2=bypass+sync, 3=bypass+copies+sync)\n", tile_mode);
+                fprintf(stderr, "[OUT_PROD_DIAG] tile_mode=%d (0=bypass, 2=bypass+sync, 3=bypass+full_flush, "
+                    "4=bypass+ctx_end+submit_nofence+ctx_begin, 5=bypass+ctx_end+submit_fence_wait+ctx_begin, "
+                    "6=bypass+ctx_end+submit_fence_wait+cleanup+ctx_begin, 1=single_tile)\n", tile_mode);
             }
 
             if (tile_mode == 0) {
                 // Bypass: direct dispatch, known correct
                 ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
             } else if (tile_mode == 2) {
-                // Bypass dispatch + sync_buffers (test if sync_buffers alone causes 0% accuracy)
+                // Bypass dispatch + sync_buffers only → WORKS
                 ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
                 ggml_vk_sync_buffers(ctx, subctx);
-            } else if (tile_mode == 3) {
-                // Bypass dispatch + submit/wait/cleanup pattern (test if command buffer disruption causes 0%)
+            } else if (tile_mode == 4) {
+                // ctx_end + submit (no fence) + ctx_begin (no cleanup)
                 ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
-                // Mimic what copy_2d_to_2d does on Adreno:
+                ggml_vk_ctx_end(subctx);
+                ggml_vk_submit(subctx, {});  // no fence
+                ggml_vk_ctx_begin(ctx->device, subctx);
+            } else if (tile_mode == 5) {
+                // ctx_end + submit with fence + wait + reset fence + ctx_begin (no cleanup)
+                ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
+                ggml_vk_ctx_end(subctx);
+                ggml_vk_submit(subctx, ctx->device->fence);
+                VK_CHECK(ctx->device->device.waitForFences({ctx->device->fence}, true, UINT64_MAX), "vk_mode5_wait");
+                ctx->device->device.resetFences({ctx->device->fence});
+                ggml_vk_ctx_begin(ctx->device, subctx);
+            } else if (tile_mode == 6) {
+                // ctx_end + submit with fence + wait + reset fence + cleanup + ctx_begin (full cycle)
+                ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
+                ggml_vk_ctx_end(subctx);
+                ggml_vk_submit(subctx, ctx->device->fence);
+                VK_CHECK(ctx->device->device.waitForFences({ctx->device->fence}, true, UINT64_MAX), "vk_mode6_wait");
+                ctx->device->device.resetFences({ctx->device->fence});
+                ggml_vk_command_pool_cleanup(ctx->device, *subctx->p);
+                ggml_vk_ctx_begin(ctx->device, subctx);
+            } else if (tile_mode == 3) {
+                // Full cycle + sync_buffers → BROKEN
+                ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
                 ggml_vk_ctx_end(subctx);
                 ggml_vk_submit(subctx, ctx->device->fence);
                 VK_CHECK(ctx->device->device.waitForFences({ctx->device->fence}, true, UINT64_MAX), "vk_mode3_wait");
