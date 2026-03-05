@@ -7210,7 +7210,7 @@ static void ggml_vk_matmul_tiling(ggml_backend_vk_context *ctx, vk_context& subc
             } else {
                 ggml_vk_copy_2d_to_2d(subctx, ctx->prealloc_tile, a_off, d_X, a_off_bytes, a_k_bytes, mt, orig_stride_a_bytes, tile_stride_a_bytes, false);
             }
-            ggml_vk_copy_2d_to_2d_pre_compute_barrier(subctx, ctx->prealloc_tile, 0, a_size_bytes + b_size_bytes);
+            ggml_vk_sync_buffers(ctx, subctx);
 
             // call matmul for the tile
             ggml_vk_matmul(
@@ -7351,15 +7351,9 @@ static void ggml_vk_out_prod_tiling(
             pc.nb22 = pc.nb21 * pc.ne21;
             pc.nb23 = pc.nb22 * pc.ne22;
 
-            ggml_vk_copy_2d_to_2d_pre_compute_barrier(subctx, ctx->prealloc_tile, 0, a_size + b_size);
-
-            // DIAG: zero D region so we can distinguish "shader didn't write" (D stays 0, copy-back
-            // reads stale A-tile-0 data) from "shader ran but computed wrong values" (D is non-zero).
-            subctx->s->buffer.fillBuffer(ctx->prealloc_tile->buffer, (vk::DeviceSize)d_off, (vk::DeviceSize)d_size, 0u);
-            subctx->s->buffer.pipelineBarrier(
-                vk::PipelineStageFlagBits::eTransfer,
-                vk::PipelineStageFlagBits::eComputeShader,
-                {}, { { { vk::AccessFlagBits::eTransferWrite }, { vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eShaderRead } } }, {}, {});
+            // Use sync_buffers (full global barrier) instead of the targeted pre_compute_barrier,
+            // since Adreno does not reliably flush/invalidate caches for ranged buffer barriers.
+            ggml_vk_sync_buffers(ctx, subctx);
 
             fprintf(stderr, "OUT_PROD_TILE m0=%u mt=%u nt=%u a_off=%zu b_off=%zu d_off=%zu d_size=%zu pc.ne=%u pc.ne00=%u pc.nb01=%u pc.ne20=%u pc.nb21=%u pc.ne10=%u pc.nb10=%u\n",
                 m0, mt, nt, (size_t)a_off, (size_t)b_off, (size_t)d_off, (size_t)d_size,
