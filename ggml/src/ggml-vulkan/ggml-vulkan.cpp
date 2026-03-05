@@ -7235,6 +7235,10 @@ static void ggml_vk_matmul_tiling(ggml_backend_vk_context *ctx, vk_context& subc
     }
 }
 
+// NOTE: OUT_PROD tiling is currently disabled due to producing incorrect results on Adreno 830.
+// The function is kept for future investigation and re-enabling.
+// NOLINTNEXTLINE(misc-unused-parameters)
+[[maybe_unused]]
 static void ggml_vk_out_prod_tiling(
         ggml_backend_vk_context *ctx, vk_context& subctx, vk_pipeline& pipeline, vk_op_binary_push_constants pc,
         const uint64_t ne00, const uint64_t ne01, const uint64_t ne10, const uint64_t ne11, const uint64_t ned0,
@@ -9769,8 +9773,6 @@ template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk
     GGML_UNUSED(src3);
 }
 
-static void ggml_vk_out_prod_request_descriptors(ggml_backend_vk_context* ctx, vk_pipeline pipeline, const ggml_tensor* src0, const ggml_tensor* src1, const ggml_tensor* dst);
-
 template <typename PC>
 static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst, ggml_op op, PC&& pc) {
     VK_LOG_DEBUG("ggml_vk_op_f32((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
@@ -9814,12 +9816,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         GGML_ABORT("fatal error");
     }
 
-    if (op == GGML_OP_OUT_PROD) {
-        // DIAGNOSTIC: Force 1 descriptor (matching force-disabled tiling)
-        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
-    } else {
-        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
-    }
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     vk_subbuffer src0_buf = ggml_vk_tensor_subbuffer(ctx, src0, true);
     vk_subbuffer src1_buf = use_src1 ? ggml_vk_tensor_subbuffer(ctx, src1, true) : vk_subbuffer{};
@@ -10081,52 +10078,11 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         break;
     }
 
-    if (op == GGML_OP_OUT_PROD) {
-        bool would_tile = ctx->device->architecture == vk_device_architecture::QUALCOMM_ADRENO &&
-            (ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) &&
-            ((ggml_nbytes(src0) + ggml_nbytes(src1) + ggml_nbytes(dst)) >= ctx->device->tiling_threshold);
+    // NOTE: OUT_PROD tiling is disabled on Adreno due to producing incorrect results.
+    // The non-tiling path falls through to the default use_src1 dispatch below.
+    // TODO: Investigate and fix ggml_vk_out_prod_tiling for Adreno 830.
 
-        // DIAGNOSTIC: Force-disable OUT_PROD tiling to isolate the bug
-        bool do_tiling = false;
-
-        {
-            static int out_prod_debug_count = 0;
-            if (out_prod_debug_count < 10) {
-                out_prod_debug_count++;
-                fprintf(stderr, "[TILING_DEBUG] OUT_PROD: would_tile=%d, do_tiling=%d (FORCED OFF), "
-                    "src0_bytes=%lu, src1_bytes=%lu, dst_bytes=%lu, total=%lu, threshold=%lu, "
-                    "ne00=%lu, ne01=%lu, ne10=%lu, ne11=%lu\n",
-                    (int)would_tile, (int)do_tiling,
-                    (unsigned long)ggml_nbytes(src0), (unsigned long)ggml_nbytes(src1), (unsigned long)ggml_nbytes(dst),
-                    (unsigned long)(ggml_nbytes(src0) + ggml_nbytes(src1) + ggml_nbytes(dst)),
-                    (unsigned long)ctx->device->tiling_threshold,
-                    (unsigned long)ne00, (unsigned long)ne01, (unsigned long)ne10, (unsigned long)ne11);
-            }
-        }
-
-        if (do_tiling) {
-            uint64_t tile_m = 0, tile_n = 0, m_tiles = 0, n_tiles = 0, num_dispatches = 0;
-
-            calculate_tile_dims(ctx, ne00, ne10, ne01, &tile_m, &tile_n, &m_tiles, &n_tiles, &num_dispatches, src0->type);
-            VK_LOG_DEBUG("[out_prod] [tile_and_dispatch] tile_m="
-                << tile_m << ", tile_n=" << tile_n << ", m_tiles=" << m_tiles << ", n_tiles=" << n_tiles
-                << ", num_dispatches=" << num_dispatches);
-
-            ctx->prealloc_size_tile = ctx->device->tiling_threshold;
-            if (ctx->prealloc_tile == nullptr || ctx->prealloc_tile->size < ctx->prealloc_size_tile) {
-                ggml_vk_preallocate_buffers(ctx, subctx);
-            }
-
-            auto pc_bin = *reinterpret_cast<const vk_op_binary_push_constants*>(&pc);
-
-            ggml_vk_out_prod_tiling(ctx, subctx, pipeline, pc_bin, ne00, ne01, ne10, ne11, dst->ne[0],
-                src0->type, src1->type, dst->type, tile_m, tile_n,
-                src0_buf.buffer, src0_buf.offset, src1_buf.buffer, src1_buf.offset, dst_buf.buffer, dst_buf.offset,
-                ggml_is_transposed(src1), ggml_nelements(dst));
-        } else {
-            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
-        }
-    } else if (op == GGML_OP_ADD || op == GGML_OP_RMS_NORM) {
+    if (op == GGML_OP_ADD || op == GGML_OP_RMS_NORM) {
         vk_subbuffer a_buf = src0_buf;
         if (ctx->do_add_rms_partials) {
             a_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_add_rms_partials, ctx->prealloc_size_add_rms_partials_offset);
@@ -12752,42 +12708,6 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
         fprintf(stderr, "[TILING_DEBUG] allocated prealloc_tile: size=%lu (%.2f MB)\n",
             (unsigned long)ctx->prealloc_tile->size, (double)ctx->prealloc_tile->size / (1024.0 * 1024.0));
     }
-}
-
-static void ggml_vk_out_prod_request_descriptors(ggml_backend_vk_context* ctx, vk_pipeline pipeline, const ggml_tensor* src0, const ggml_tensor* src1, const ggml_tensor* dst) {
-    const uint64_t ne00 = src0->ne[0];
-    const uint64_t ne01 = src0->ne[1];
-    const uint64_t ne02 = src0->ne[2];
-    const uint64_t ne03 = src0->ne[3];
-    const uint64_t ne0 = ne00 * ne01;
-
-    const uint64_t ne10 = src1->ne[0];
-    const uint64_t ne11 = src1->ne[1];
-    const uint64_t ne12 = src1->ne[2];
-    const uint64_t ne13 = src1->ne[3];
-    const uint64_t ne1 = ne10 * ne11;
-
-    const uint64_t ned0 = dst->ne[0];
-    const uint64_t ned1 = dst->ne[1];
-    const uint64_t ned = ned0 * ned1;
-
-    uint64_t x_sz = CEIL_DIV(ne0, ggml_blck_size(src0->type)) * ggml_type_size(src0->type);
-    uint64_t y_sz = ggml_type_size(src1->type) * ne1;
-    uint64_t d_sz = ggml_type_size(dst->type) * ned;
-
-    bool do_tiling =
-        ctx->device->architecture == vk_device_architecture::QUALCOMM_ADRENO &&
-        (ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) &&
-        (x_sz + y_sz + d_sz >= ctx->device->tiling_threshold);
-
-    uint64_t tile_m = 0, tile_n = 0, m_tiles = 0, n_tiles = 0, num_dispatches = 1;
-    if (do_tiling) {
-        calculate_tile_dims(ctx, ne00, ne10, ne01, &tile_m, &tile_n, &m_tiles, &n_tiles, &num_dispatches, src0->type);
-        VK_LOG_DEBUG("[out_prod] [request_descriptor_sets] tile_m=" << tile_m << ", tile_n=" << tile_n
-            << ", m_tiles=" << m_tiles << ", n_tiles=" << n_tiles << ", num_dispatches=" << num_dispatches << "\n");
-        ctx->prealloc_size_tile = ctx->device->tiling_threshold;
-    }
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, num_dispatches);
 }
 
 static void ggml_vk_compute_forward(ggml_backend_vk_context* ctx, ggml_cgraph * cgraph, ggml_tensor* tensor, int tensor_idx, bool almost_ready);
