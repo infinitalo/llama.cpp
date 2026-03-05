@@ -7353,6 +7353,18 @@ static void ggml_vk_out_prod_tiling(
 
             ggml_vk_copy_2d_to_2d_pre_compute_barrier(subctx, ctx->prealloc_tile, 0, a_size + b_size);
 
+            // DIAG: zero D region so we can distinguish "shader didn't write" (D stays 0, copy-back
+            // reads stale A-tile-0 data) from "shader ran but computed wrong values" (D is non-zero).
+            subctx->s->buffer.fillBuffer(ctx->prealloc_tile->buffer, (vk::DeviceSize)d_off, (vk::DeviceSize)d_size, 0u);
+            subctx->s->buffer.pipelineBarrier(
+                vk::PipelineStageFlagBits::eTransfer,
+                vk::PipelineStageFlagBits::eComputeShader,
+                {}, { { { vk::AccessFlagBits::eTransferWrite }, { vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eShaderRead } } }, {}, {});
+
+            fprintf(stderr, "OUT_PROD_TILE m0=%u mt=%u nt=%u a_off=%zu b_off=%zu d_off=%zu d_size=%zu pc.ne=%u pc.ne00=%u pc.nb01=%u pc.ne20=%u pc.nb21=%u pc.ne10=%u pc.nb10=%u\n",
+                m0, mt, nt, (size_t)a_off, (size_t)b_off, (size_t)d_off, (size_t)d_size,
+                pc.ne, pc.ne00, pc.nb01, pc.ne20, pc.nb21, pc.ne10, pc.nb10);
+
             vk_subbuffer a = { ctx->prealloc_tile, a_off, a_size };
             vk_subbuffer b = { ctx->prealloc_tile, b_off, b_size };
             vk_subbuffer d = { ctx->prealloc_tile, d_off, d_size };
