@@ -7358,6 +7358,33 @@ static void ggml_vk_out_prod_tiling(
 
             ggml_vk_copy_2d_to_2d_pre_compute_barrier(subctx, ctx->prealloc_tile, 0, a_size + b_size);
 
+            {
+                static int tile_diag_count = 0;
+                if (tile_diag_count < 10) {
+                    tile_diag_count++;
+                    fprintf(stderr, "[TILE_PC] m0=%u n0=%u mt=%u nt=%u REWRITTEN PC: ne=%u "
+                        "ne00=%u ne01=%u ne02=%u ne03=%u nb00=%u nb01=%u nb02=%u nb03=%u "
+                        "ne10=%u ne11=%u ne12=%u ne13=%u nb10=%u nb11=%u nb12=%u nb13=%u "
+                        "ne20=%u ne21=%u ne22=%u ne23=%u nb20=%u nb21=%u nb22=%u nb23=%u "
+                        "misalign=0x%08x "
+                        "a_off=%lu a_sz=%lu b_off=%lu b_sz=%lu d_off=%lu d_sz=%lu "
+                        "elements={%u,%u,%u}\n",
+                        m0, n0, mt, nt,
+                        pc.ne,
+                        pc.ne00, pc.ne01, pc.ne02, pc.ne03,
+                        pc.nb00, pc.nb01, pc.nb02, pc.nb03,
+                        pc.ne10, pc.ne11, pc.ne12, pc.ne13,
+                        pc.nb10, pc.nb11, pc.nb12, pc.nb13,
+                        pc.ne20, pc.ne21, pc.ne22, pc.ne23,
+                        pc.nb20, pc.nb21, pc.nb22, pc.nb23,
+                        pc.misalign_offsets,
+                        (unsigned long)a_off, (unsigned long)a_size,
+                        (unsigned long)b_off, (unsigned long)b_size,
+                        (unsigned long)d_off, (unsigned long)d_size,
+                        elements[0], elements[1], elements[2]);
+                }
+            }
+
             vk_subbuffer a = { ctx->prealloc_tile, a_off, a_size };
             vk_subbuffer b = { ctx->prealloc_tile, b_off, b_size };
             vk_subbuffer d = { ctx->prealloc_tile, d_off, d_size };
@@ -10083,50 +10110,68 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             ((ggml_nbytes(src0) + ggml_nbytes(src1) + ggml_nbytes(dst)) >= ctx->device->tiling_threshold);
 
         if (do_tiling) {
-            // Force single tile covering the entire tensor
-            uint64_t tile_m = ne00;
-            uint64_t tile_n = ne10;
-            uint64_t m_tiles = 1, n_tiles = 1, num_dispatches = 1;
+            // GGML_VK_OUT_PROD_TILE_MODE:
+            //   0 = bypass (direct dispatch, no tiling — known good)
+            //   1 = single tile through tiling function
+            static int tile_mode = -1;
+            if (tile_mode < 0) {
+                const char *env = getenv("GGML_VK_OUT_PROD_TILE_MODE");
+                tile_mode = env ? atoi(env) : 0;
+                fprintf(stderr, "[OUT_PROD_DIAG] tile_mode=%d (0=bypass, 1=single_tile)\n", tile_mode);
+            }
 
-            // Calculate actual buffer size needed for the entire tensors
-            uint64_t a_sz = CEIL_DIV(ne00 * ne01, ggml_blck_size(src0->type)) * ggml_type_size(src0->type);
-            uint64_t b_sz = CEIL_DIV(ne10 * ne11, ggml_blck_size(src1->type)) * ggml_type_size(src1->type);
-            uint64_t d_sz = ne00 * ne10 * ggml_type_size(dst->type);
-            ctx->prealloc_size_tile = a_sz + b_sz + d_sz + 4096;
+            if (tile_mode == 0) {
+                // Bypass: direct dispatch, known correct
+                ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
+            } else {
+                // Single tile through tiling function
+                uint64_t tile_m = ne00;
+                uint64_t tile_n = ne10;
 
-            auto pc_bin = *reinterpret_cast<const vk_op_binary_push_constants*>(&pc);
+                uint64_t a_sz = CEIL_DIV(ne00 * ne01, ggml_blck_size(src0->type)) * ggml_type_size(src0->type);
+                uint64_t b_sz = CEIL_DIV(ne10 * ne11, ggml_blck_size(src1->type)) * ggml_type_size(src1->type);
+                uint64_t d_sz = ne00 * ne10 * ggml_type_size(dst->type);
+                ctx->prealloc_size_tile = a_sz + b_sz + d_sz + 4096;
 
-            {
-                static int debug_count = 0;
-                if (debug_count < 5) {
-                    debug_count++;
-                    fprintf(stderr, "[OUT_PROD_DIAG] SINGLE TILE: ne00=%lu ne01=%lu ne10=%lu ne11=%lu "
-                        "tile_m=%lu tile_n=%lu misalign_offsets=0x%08x "
-                        "a_misalign=%u b_misalign=%u d_misalign=%u "
-                        "src0_buf_off=%lu src1_buf_off=%lu dst_buf_off=%lu "
-                        "tile_buf_size=%lu (a=%lu b=%lu d=%lu)\n",
-                        (unsigned long)ne00, (unsigned long)ne01,
-                        (unsigned long)ne10, (unsigned long)ne11,
-                        (unsigned long)tile_m, (unsigned long)tile_n,
-                        pc_bin.misalign_offsets,
-                        get_misalign_bytes(ctx, src0),
-                        get_misalign_bytes(ctx, src1),
-                        get_misalign_bytes(ctx, dst),
-                        (unsigned long)src0_buf.offset, (unsigned long)src1_buf.offset,
-                        (unsigned long)dst_buf.offset,
-                        (unsigned long)ctx->prealloc_size_tile,
-                        (unsigned long)a_sz, (unsigned long)b_sz, (unsigned long)d_sz);
+                auto pc_bin = *reinterpret_cast<const vk_op_binary_push_constants*>(&pc);
+
+                {
+                    static int debug_count = 0;
+                    if (debug_count < 10) {
+                        debug_count++;
+                        // Print BOTH the push constants that bypass would use, and what tiling will rewrite
+                        fprintf(stderr, "[OUT_PROD_DIAG] ORIGINAL PC: ne=%u "
+                            "ne00=%u ne01=%u ne02=%u ne03=%u nb00=%u nb01=%u nb02=%u nb03=%u "
+                            "ne10=%u ne11=%u ne12=%u ne13=%u nb10=%u nb11=%u nb12=%u nb13=%u "
+                            "ne20=%u ne21=%u ne22=%u ne23=%u nb20=%u nb21=%u nb22=%u nb23=%u "
+                            "misalign=0x%08x param1=%f param2=%f param3=%d\n",
+                            pc_bin.ne,
+                            pc_bin.ne00, pc_bin.ne01, pc_bin.ne02, pc_bin.ne03,
+                            pc_bin.nb00, pc_bin.nb01, pc_bin.nb02, pc_bin.nb03,
+                            pc_bin.ne10, pc_bin.ne11, pc_bin.ne12, pc_bin.ne13,
+                            pc_bin.nb10, pc_bin.nb11, pc_bin.nb12, pc_bin.nb13,
+                            pc_bin.ne20, pc_bin.ne21, pc_bin.ne22, pc_bin.ne23,
+                            pc_bin.nb20, pc_bin.nb21, pc_bin.nb22, pc_bin.nb23,
+                            pc_bin.misalign_offsets,
+                            pc_bin.param1, pc_bin.param2, pc_bin.param3);
+                        fprintf(stderr, "[OUT_PROD_DIAG] src0_buf: buffer=%p offset=%lu size=%lu\n",
+                            (void*)src0_buf.buffer.get(), (unsigned long)src0_buf.offset, (unsigned long)src0_buf.size);
+                        fprintf(stderr, "[OUT_PROD_DIAG] src1_buf: buffer=%p offset=%lu size=%lu\n",
+                            (void*)src1_buf.buffer.get(), (unsigned long)src1_buf.offset, (unsigned long)src1_buf.size);
+                        fprintf(stderr, "[OUT_PROD_DIAG] dst_buf:  buffer=%p offset=%lu size=%lu\n",
+                            (void*)dst_buf.buffer.get(), (unsigned long)dst_buf.offset, (unsigned long)dst_buf.size);
+                    }
                 }
-            }
 
-            if (ctx->prealloc_tile == nullptr || ctx->prealloc_tile->size < ctx->prealloc_size_tile) {
-                ggml_vk_preallocate_buffers(ctx, subctx);
-            }
+                if (ctx->prealloc_tile == nullptr || ctx->prealloc_tile->size < ctx->prealloc_size_tile) {
+                    ggml_vk_preallocate_buffers(ctx, subctx);
+                }
 
-            ggml_vk_out_prod_tiling(ctx, subctx, pipeline, pc_bin, ne00, ne01, ne10, ne11, dst->ne[0],
-                src0->type, src1->type, dst->type, tile_m, tile_n,
-                src0_buf.buffer, src0_buf.offset, src1_buf.buffer, src1_buf.offset, dst_buf.buffer, dst_buf.offset,
-                ggml_is_transposed(src1), ggml_nelements(dst));
+                ggml_vk_out_prod_tiling(ctx, subctx, pipeline, pc_bin, ne00, ne01, ne10, ne11, dst->ne[0],
+                    src0->type, src1->type, dst->type, tile_m, tile_n,
+                    src0_buf.buffer, src0_buf.offset, src1_buf.buffer, src1_buf.offset, dst_buf.buffer, dst_buf.offset,
+                    ggml_is_transposed(src1), ggml_nelements(dst));
+            }
         } else {
             ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
         }
