@@ -7235,10 +7235,6 @@ static void ggml_vk_matmul_tiling(ggml_backend_vk_context *ctx, vk_context& subc
     }
 }
 
-// NOTE: OUT_PROD tiling is currently disabled due to producing incorrect results on Adreno 830.
-// The function is kept for future investigation and re-enabling.
-// NOLINTNEXTLINE(misc-unused-parameters)
-[[maybe_unused]]
 static void ggml_vk_out_prod_tiling(
         ggml_backend_vk_context *ctx, vk_context& subctx, vk_pipeline& pipeline, vk_op_binary_push_constants pc,
         const uint64_t ne00, const uint64_t ne01, const uint64_t ne10, const uint64_t ne11, const uint64_t ned0,
@@ -7312,8 +7308,8 @@ static void ggml_vk_out_prod_tiling(
 
             const uint64_t dst_copy_row_size = CEIL_DIV(mt, d_elems_per_block) * d_bytes_per_block;
 
-            GGML_ASSERT(a_size + b_size + d_size < ctx->device->tiling_threshold);
-            GGML_ASSERT(d_off + d_size < ctx->device->tiling_threshold);
+            GGML_ASSERT(a_size + b_size + d_size <= ctx->prealloc_tile->size);
+            GGML_ASSERT(d_off + d_size <= ctx->prealloc_tile->size);
 
             GGML_ASSERT(ne01 == ne11);
 
@@ -10078,11 +10074,63 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         break;
     }
 
-    // NOTE: OUT_PROD tiling is disabled on Adreno due to producing incorrect results.
-    // The non-tiling path falls through to the default use_src1 dispatch below.
-    // TODO: Investigate and fix ggml_vk_out_prod_tiling for Adreno 830.
+    // DIAGNOSTIC: Re-enable OUT_PROD tiling with single-tile mode to isolate the bug.
+    // If single tile works → multi-tile iteration is broken.
+    // If single tile also fails → per-tile logic (copy/compute/copyback) is broken.
+    if (op == GGML_OP_OUT_PROD) {
+        bool do_tiling = ctx->device->architecture == vk_device_architecture::QUALCOMM_ADRENO &&
+            (ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) &&
+            ((ggml_nbytes(src0) + ggml_nbytes(src1) + ggml_nbytes(dst)) >= ctx->device->tiling_threshold);
 
-    if (op == GGML_OP_ADD || op == GGML_OP_RMS_NORM) {
+        if (do_tiling) {
+            // Force single tile covering the entire tensor
+            uint64_t tile_m = ne00;
+            uint64_t tile_n = ne10;
+            uint64_t m_tiles = 1, n_tiles = 1, num_dispatches = 1;
+
+            // Calculate actual buffer size needed for the entire tensors
+            uint64_t a_sz = CEIL_DIV(ne00 * ne01, ggml_blck_size(src0->type)) * ggml_type_size(src0->type);
+            uint64_t b_sz = CEIL_DIV(ne10 * ne11, ggml_blck_size(src1->type)) * ggml_type_size(src1->type);
+            uint64_t d_sz = ne00 * ne10 * ggml_type_size(dst->type);
+            ctx->prealloc_size_tile = a_sz + b_sz + d_sz + 4096;
+
+            auto pc_bin = *reinterpret_cast<const vk_op_binary_push_constants*>(&pc);
+
+            {
+                static int debug_count = 0;
+                if (debug_count < 5) {
+                    debug_count++;
+                    fprintf(stderr, "[OUT_PROD_DIAG] SINGLE TILE: ne00=%lu ne01=%lu ne10=%lu ne11=%lu "
+                        "tile_m=%lu tile_n=%lu misalign_offsets=0x%08x "
+                        "a_misalign=%u b_misalign=%u d_misalign=%u "
+                        "src0_buf_off=%lu src1_buf_off=%lu dst_buf_off=%lu "
+                        "tile_buf_size=%lu (a=%lu b=%lu d=%lu)\n",
+                        (unsigned long)ne00, (unsigned long)ne01,
+                        (unsigned long)ne10, (unsigned long)ne11,
+                        (unsigned long)tile_m, (unsigned long)tile_n,
+                        pc_bin.misalign_offsets,
+                        get_misalign_bytes(ctx, src0),
+                        get_misalign_bytes(ctx, src1),
+                        get_misalign_bytes(ctx, dst),
+                        (unsigned long)src0_buf.offset, (unsigned long)src1_buf.offset,
+                        (unsigned long)dst_buf.offset,
+                        (unsigned long)ctx->prealloc_size_tile,
+                        (unsigned long)a_sz, (unsigned long)b_sz, (unsigned long)d_sz);
+                }
+            }
+
+            if (ctx->prealloc_tile == nullptr || ctx->prealloc_tile->size < ctx->prealloc_size_tile) {
+                ggml_vk_preallocate_buffers(ctx, subctx);
+            }
+
+            ggml_vk_out_prod_tiling(ctx, subctx, pipeline, pc_bin, ne00, ne01, ne10, ne11, dst->ne[0],
+                src0->type, src1->type, dst->type, tile_m, tile_n,
+                src0_buf.buffer, src0_buf.offset, src1_buf.buffer, src1_buf.offset, dst_buf.buffer, dst_buf.offset,
+                ggml_is_transposed(src1), ggml_nelements(dst));
+        } else {
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
+        }
+    } else if (op == GGML_OP_ADD || op == GGML_OP_RMS_NORM) {
         vk_subbuffer a_buf = src0_buf;
         if (ctx->do_add_rms_partials) {
             a_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_add_rms_partials, ctx->prealloc_size_add_rms_partials_offset);
