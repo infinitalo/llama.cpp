@@ -7363,8 +7363,21 @@ static void ggml_vk_out_prod_tiling(
             vk_subbuffer d = { ctx->prealloc_tile, d_off, d_size };
             ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d }, pc, elements);
 
+            // On Adreno, explicitly submit and wait for the compute dispatch
+            // to complete before copying results back. This ensures compute
+            // shader writes are fully visible to subsequent transfer reads.
+            if (ctx->device->architecture == vk_device_architecture::QUALCOMM_ADRENO) {
+                ggml_vk_ctx_end(subctx);
+                ggml_vk_submit(subctx, ctx->device->fence);
+                VK_CHECK(ctx->device->device.waitForFences({ ctx->device->fence }, true, UINT64_MAX), "vk wait out_prod compute");
+                ctx->device->device.resetFences({ ctx->device->fence });
+                ggml_vk_command_pool_cleanup(ctx->device, *subctx->p);
+                ggml_vk_ctx_begin(ctx->device, subctx);
+            } else {
+                ggml_vk_copy_2d_to_2d_post_compute_barrier(subctx, ctx->prealloc_tile, d_off, d_size);
+            }
+
             // Copy results back to dst buffer
-            ggml_vk_copy_2d_to_2d_post_compute_barrier(subctx, ctx->prealloc_tile, d_off, d_size);
             ggml_vk_copy_2d_to_2d(subctx, d_D, d_off_bytes, ctx->prealloc_tile, d_off, dst_copy_row_size, nt, tile_stride_d_bytes, orig_stride_d_bytes);
 
             ggml_vk_sync_buffers(ctx, subctx);
