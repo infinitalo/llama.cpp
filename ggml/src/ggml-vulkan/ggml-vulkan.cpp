@@ -7288,6 +7288,33 @@ static void ggml_vk_out_prod_tiling(
         // copy b tile
         ggml_vk_copy_2d_to_2d(subctx, ctx->prealloc_tile, b_off, d_Y, b_off_bytes, b_nt_bytes, b_height, orig_stride_b_bytes, tile_stride_b_bytes);
 
+        // CPU-side validation of B copy (after submit+fence on Adreno)
+        {
+            static int b_validate_count = 0;
+            if (b_validate_count < 2 && d_Y->info.pMappedData && ctx->prealloc_tile->info.pMappedData) {
+                b_validate_count++;
+                const char* src_ptr = (const char*)d_Y->info.pMappedData + b_off_bytes;
+                const char* tile_ptr = (const char*)ctx->prealloc_tile->info.pMappedData + b_off;
+                size_t check_size = std::min<size_t>(b_size, 1024);
+                int mismatches = 0;
+                for (size_t i = 0; i < check_size; i++) {
+                    if (tile_ptr[i] != src_ptr[i]) mismatches++;
+                }
+                // Also check last 1024 bytes
+                int tail_mismatches = 0;
+                size_t tail_start = b_size > 1024 ? b_size - 1024 : 0;
+                for (size_t i = tail_start; i < b_size; i++) {
+                    if (tile_ptr[i] != src_ptr[i]) tail_mismatches++;
+                }
+                const float* sf = (const float*)src_ptr;
+                const float* tf = (const float*)tile_ptr;
+                fprintf(stderr, "[COPY_VALIDATE] B: head_mismatches=%d/%zu tail_mismatches=%d total_bytes=%lu\n",
+                    mismatches, check_size, tail_mismatches, (unsigned long)b_size);
+                fprintf(stderr, "[COPY_VALIDATE] B src  first4: %.8f %.8f %.8f %.8f\n", sf[0], sf[1], sf[2], sf[3]);
+                fprintf(stderr, "[COPY_VALIDATE] B tile first4: %.8f %.8f %.8f %.8f\n", tf[0], tf[1], tf[2], tf[3]);
+            }
+        }
+
         for (uint32_t m0 = 0; m0 < ne00; m0 += tile_m) {
             const uint32_t mt = (uint32_t) std::min(tile_m, ne00 - m0);
             uint64_t a_off_bytes = x_buf_offset + ((uint64_t)m0 / a_elems_per_block) * (uint64_t)a_bytes_per_block;
@@ -7315,6 +7342,33 @@ static void ggml_vk_out_prod_tiling(
 
             // copy a tile
             ggml_vk_copy_2d_to_2d(subctx, ctx->prealloc_tile, a_off, d_X, a_off_bytes, a_mt_bytes, ne01, orig_stride_a_bytes, tile_stride_a_bytes);
+
+            // CPU-side validation of A copy
+            {
+                static int a_validate_count = 0;
+                if (a_validate_count < 2 && d_X->info.pMappedData && ctx->prealloc_tile->info.pMappedData) {
+                    a_validate_count++;
+                    const char* src_ptr = (const char*)d_X->info.pMappedData + a_off_bytes;
+                    const char* tile_ptr = (const char*)ctx->prealloc_tile->info.pMappedData + a_off;
+                    size_t check_size = std::min<size_t>(a_size, 1024);
+                    int mismatches = 0;
+                    for (size_t i = 0; i < check_size; i++) {
+                        if (tile_ptr[i] != src_ptr[i]) mismatches++;
+                    }
+                    int tail_mismatches = 0;
+                    size_t tail_start = a_size > 1024 ? a_size - 1024 : 0;
+                    for (size_t i = tail_start; i < a_size; i++) {
+                        if (tile_ptr[i] != src_ptr[i]) tail_mismatches++;
+                    }
+                    fprintf(stderr, "[COPY_VALIDATE] A: head_mismatches=%d/%zu tail_mismatches=%d total_bytes=%lu\n",
+                        mismatches, check_size, tail_mismatches, (unsigned long)a_size);
+                    // Print first 4 raw uint32s (q4_0 blocks)
+                    const uint32_t* su = (const uint32_t*)src_ptr;
+                    const uint32_t* tu = (const uint32_t*)tile_ptr;
+                    fprintf(stderr, "[COPY_VALIDATE] A src  first4u32: 0x%08x 0x%08x 0x%08x 0x%08x\n", su[0], su[1], su[2], su[3]);
+                    fprintf(stderr, "[COPY_VALIDATE] A tile first4u32: 0x%08x 0x%08x 0x%08x 0x%08x\n", tu[0], tu[1], tu[2], tu[3]);
+                }
+            }
 
             std::array<uint32_t, 3> elements;
 
@@ -10123,6 +10177,40 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             if (tile_mode == 0) {
                 // Bypass: direct dispatch, known correct
                 ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
+
+                // Force flush GPU work and validate output
+                {
+                    static int bypass_validate_count = 0;
+                    if (bypass_validate_count < 2) {
+                        bypass_validate_count++;
+                        // Submit and wait to get the result
+                        ggml_vk_ctx_end(subctx);
+                        ggml_vk_submit(subctx, ctx->device->fence);
+                        VK_CHECK(ctx->device->device.waitForFences({ctx->device->fence}, true, UINT64_MAX), "vk_diag_wait");
+                        ctx->device->device.resetFences({ctx->device->fence});
+                        ggml_vk_command_pool_cleanup(ctx->device, *subctx->p);
+                        ggml_vk_ctx_begin(ctx->device, subctx);
+
+                        if (dst_buf.buffer->info.pMappedData) {
+                            const float* out = (const float*)((const char*)dst_buf.buffer->info.pMappedData + dst_buf.offset);
+                            uint32_t nout = ggml_nelements(dst);
+                            double sum = 0; int nans = 0; int infs = 0; int zeros = 0;
+                            for (uint32_t i = 0; i < nout; i++) {
+                                if (std::isnan(out[i])) nans++;
+                                else if (std::isinf(out[i])) infs++;
+                                else { sum += out[i]; if (out[i] == 0.0f) zeros++; }
+                            }
+                            fprintf(stderr, "[D_VALIDATE] BYPASS output: nout=%u sum=%.6f nans=%d infs=%d zeros=%d\n",
+                                nout, sum, nans, infs, zeros);
+                            fprintf(stderr, "[D_VALIDATE] BYPASS first8: %.8f %.8f %.8f %.8f %.8f %.8f %.8f %.8f\n",
+                                out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7]);
+                            fprintf(stderr, "[D_VALIDATE] BYPASS last4: %.8f %.8f %.8f %.8f\n",
+                                out[nout-4], out[nout-3], out[nout-2], out[nout-1]);
+                        } else {
+                            fprintf(stderr, "[D_VALIDATE] BYPASS: dst buffer not mapped!\n");
+                        }
+                    }
+                }
             } else {
                 // Single tile through tiling function
                 uint64_t tile_m = ne00;
@@ -10171,6 +10259,48 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
                     src0->type, src1->type, dst->type, tile_m, tile_n,
                     src0_buf.buffer, src0_buf.offset, src1_buf.buffer, src1_buf.offset, dst_buf.buffer, dst_buf.offset,
                     ggml_is_transposed(src1), ggml_nelements(dst));
+
+                // Validate tiling output (GPU work already flushed by tiling function)
+                {
+                    static int tiling_validate_count = 0;
+                    if (tiling_validate_count < 2) {
+                        tiling_validate_count++;
+                        if (dst_buf.buffer->info.pMappedData) {
+                            const float* out = (const float*)((const char*)dst_buf.buffer->info.pMappedData + dst_buf.offset);
+                            uint32_t nout = ggml_nelements(dst);
+                            double sum = 0; int nans = 0; int infs = 0; int zeros = 0;
+                            for (uint32_t i = 0; i < nout; i++) {
+                                if (std::isnan(out[i])) nans++;
+                                else if (std::isinf(out[i])) infs++;
+                                else { sum += out[i]; if (out[i] == 0.0f) zeros++; }
+                            }
+                            fprintf(stderr, "[D_VALIDATE] TILING output: nout=%u sum=%.6f nans=%d infs=%d zeros=%d\n",
+                                nout, sum, nans, infs, zeros);
+                            fprintf(stderr, "[D_VALIDATE] TILING first8: %.8f %.8f %.8f %.8f %.8f %.8f %.8f %.8f\n",
+                                out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7]);
+                            fprintf(stderr, "[D_VALIDATE] TILING last4: %.8f %.8f %.8f %.8f\n",
+                                out[nout-4], out[nout-3], out[nout-2], out[nout-1]);
+                            
+                            // Also check tile D buffer before copy-back to see if compute result is correct
+                            if (ctx->prealloc_tile->info.pMappedData) {
+                                uint64_t b_sz_check = CEIL_DIV(ne10 * ne11, ggml_blck_size(src1->type)) * ggml_type_size(src1->type);
+                                uint64_t a_sz_check = CEIL_DIV(ne00 * ne01, ggml_blck_size(src0->type)) * ggml_type_size(src0->type);
+                                uint64_t d_off_check = a_sz_check + b_sz_check;
+                                const float* tile_d = (const float*)((const char*)ctx->prealloc_tile->info.pMappedData + d_off_check);
+                                double tile_sum = 0; int tile_nans = 0;
+                                uint32_t d_sz_elems = ne00 * ne10;
+                                for (uint32_t i = 0; i < d_sz_elems; i++) {
+                                    if (std::isnan(tile_d[i])) tile_nans++;
+                                    else tile_sum += tile_d[i];
+                                }
+                                fprintf(stderr, "[D_VALIDATE] TILE_D (pre-copyback): sum=%.6f nans=%d first4: %.8f %.8f %.8f %.8f\n",
+                                    tile_sum, tile_nans, tile_d[0], tile_d[1], tile_d[2], tile_d[3]);
+                            }
+                        } else {
+                            fprintf(stderr, "[D_VALIDATE] TILING: dst buffer not mapped!\n");
+                        }
+                    }
+                }
             }
         } else {
             ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
