@@ -7224,7 +7224,10 @@ static void ggml_vk_matmul_tiling(ggml_backend_vk_context *ctx, vk_context& subc
             );
 
             // copy results back to dst buffer
-            ggml_vk_copy_2d_to_2d_post_compute_barrier(subctx, ctx->prealloc_tile, d_off, d_size_bytes);
+            // Use sync_buffers (full global barrier) instead of the targeted post_compute_barrier,
+            // since Adreno does not reliably flush shader write caches for non-zero offsets within
+            // a buffer with the targeted VK_ACCESS_SHADER_WRITE_BIT -> VK_ACCESS_TRANSFER_READ_BIT.
+            ggml_vk_sync_buffers(ctx, subctx);
             ggml_vk_copy_2d_to_2d(subctx, d_D, d_off_bytes, ctx->prealloc_tile, d_off, dst_copy_row_size, nt, tile_stride_d_bytes, orig_stride_d_bytes, false);
 
             ggml_vk_sync_buffers(ctx, subctx);
@@ -7356,7 +7359,10 @@ static void ggml_vk_out_prod_tiling(
             ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d }, pc, elements);
 
             // Copy results back to dst buffer
-            ggml_vk_copy_2d_to_2d_post_compute_barrier(subctx, ctx->prealloc_tile, d_off, d_size);
+            // Use sync_buffers (full global barrier) instead of the targeted post_compute_barrier,
+            // since Adreno does not reliably flush shader write caches for non-zero offsets within
+            // a buffer with the targeted VK_ACCESS_SHADER_WRITE_BIT -> VK_ACCESS_TRANSFER_READ_BIT.
+            ggml_vk_sync_buffers(ctx, subctx);
             ggml_vk_copy_2d_to_2d(subctx, d_D, d_off_bytes, ctx->prealloc_tile, d_off, dst_copy_row_size, nt, tile_stride_d_bytes, orig_stride_d_bytes, false);
 
             ggml_vk_sync_buffers(ctx, subctx);
