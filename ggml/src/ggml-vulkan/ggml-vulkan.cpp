@@ -7124,12 +7124,17 @@ static void calculate_tile_dims(ggml_backend_vk_context * ctx,
     *num_dispatches = (*m_tiles) * (*n_tiles);
 }
 
+// When dequant_a_pipeline is non-null, src A is raw-quantized (raw_a_type) and is dequantized
+// per-tile directly into prealloc_tile, bypassing the full-matrix dequant dispatch that would
+// bind a descriptor larger than the Adreno 128MB descriptor buffer address space limit.
 static void ggml_vk_matmul_tiling(ggml_backend_vk_context *ctx, vk_context& subctx, vk_pipeline& pipeline,
         const uint64_t ne00, const uint64_t ne01, const uint64_t ne10, const uint64_t ne11, const uint64_t ne20,
         ggml_type a_type, ggml_type b_type, ggml_type d_type, const uint64_t tile_m, const uint64_t tile_n,
         vk_buffer& d_X, size_t x_buf_offset,
         vk_buffer& d_Y, size_t y_buf_offset,
-        vk_buffer& d_D, size_t d_buf_offset) {
+        vk_buffer& d_D, size_t d_buf_offset,
+        vk_pipeline dequant_a_pipeline = nullptr, vk_buffer d_Qx = nullptr,
+        size_t qx_buf_offset = 0, ggml_type raw_a_type = GGML_TYPE_COUNT) {
     VK_LOG_DEBUG("ggml_vk_matmul_tiling(ne00=" << ne00 << ", ne01=" << ne01 << ", ne10=" << ne10 << ", ne11=" << ne11
         << ", a_type=" << ggml_type_name(a_type) << ", b_type=" << ggml_type_name(b_type) << ", d_type=" << ggml_type_name(d_type) << ")");
 
@@ -7141,6 +7146,10 @@ static void ggml_vk_matmul_tiling(ggml_backend_vk_context *ctx, vk_context& subc
 
     uint32_t d_bytes_per_block = ggml_type_size(d_type);
     uint32_t d_elems_per_block = ggml_blck_size(d_type);
+
+    // raw quantized type dimensions (used when dequant_a_pipeline != nullptr)
+    const uint32_t raw_a_bytes_per_block = (dequant_a_pipeline != nullptr) ? ggml_type_size(raw_a_type) : 0;
+    const uint32_t raw_a_elems_per_block = (dequant_a_pipeline != nullptr) ? ggml_blck_size(raw_a_type) : 0;
 
     for (uint32_t n0 = 0; n0 < ne11; n0 += tile_n) {
         const uint32_t nt = (uint32_t) std::min(tile_n, ne11 - n0);
@@ -7183,8 +7192,24 @@ static void ggml_vk_matmul_tiling(ggml_backend_vk_context *ctx, vk_context& subc
             GGML_ASSERT(a_size_bytes + b_size_bytes + d_size_bytes < ctx->device->tiling_threshold);
             GGML_ASSERT(d_off + d_size_bytes < ctx->device->tiling_threshold);
 
-            // copy tile a data to buffer a
-            ggml_vk_copy_2d_to_2d(subctx, ctx->prealloc_tile, a_off, d_X, a_off_bytes, a_k_bytes, mt, orig_stride_a_bytes, tile_stride_a_bytes, false);
+            // load tile a: either dequant raw-quantized data directly into prealloc_tile,
+            // or copy already-dequantized data (avoids a large descriptor binding on Adreno).
+            if (dequant_a_pipeline != nullptr) {
+                // Per-tile dequant: raw quantized tile → prealloc_tile f16 area.
+                // Both bindings stay well under the 128MB Adreno descriptor address space limit.
+                const uint64_t raw_a_off = qx_buf_offset +
+                    CEIL_DIV((uint64_t)m0 * (uint64_t)ne00, raw_a_elems_per_block) * raw_a_bytes_per_block;
+                const uint64_t raw_a_size = CEIL_DIV((uint64_t)mt * (uint64_t)ne00, raw_a_elems_per_block) * raw_a_bytes_per_block;
+                const std::vector<uint32_t> dequant_pc = {
+                    mt, (uint32_t)ne00, (uint32_t)ne00, (uint32_t)ne00, (uint32_t)(mt * ne00)
+                };
+                ggml_vk_dispatch_pipeline(ctx, subctx, dequant_a_pipeline,
+                    { vk_subbuffer{d_Qx, raw_a_off, raw_a_size},
+                      vk_subbuffer{ctx->prealloc_tile, a_off, a_size_bytes} },
+                    dequant_pc, { (uint32_t)(mt * ne00), 1, 1 });
+            } else {
+                ggml_vk_copy_2d_to_2d(subctx, ctx->prealloc_tile, a_off, d_X, a_off_bytes, a_k_bytes, mt, orig_stride_a_bytes, tile_stride_a_bytes, false);
+            }
             ggml_vk_copy_2d_to_2d_pre_compute_barrier(subctx, ctx->prealloc_tile, 0, a_size_bytes + b_size_bytes);
 
             // call matmul for the tile
@@ -7505,7 +7530,11 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         // Request descriptor sets
         ggml_pipeline_request_descriptor_sets(ctx, pipeline, num_dispatches);
         if (qx_needs_dequant) {
-            ggml_pipeline_request_descriptor_sets(ctx, to_fp16_vk_0, 1);
+            // When tiling, the full-matrix dequant is skipped. Instead we dequant per tile
+            // inside the tiling loop (n_tiles * m_tiles = num_dispatches dequant dispatches).
+            // When not tiling, a single full-matrix dequant dispatch is used.
+            const uint32_t dequant_ds = do_tiling ? (uint32_t)num_dispatches : 1;
+            ggml_pipeline_request_descriptor_sets(ctx, to_fp16_vk_0, dequant_ds);
         }
         if (qy_needs_dequant) {
             ggml_pipeline_request_descriptor_sets(ctx, to_fp16_vk_1, 1);
@@ -7555,7 +7584,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         GGML_ASSERT(qy_sz == y_sz);
     }
 
-    if (x_non_contig || qx_needs_dequant) {
+    if (x_non_contig || (qx_needs_dequant && !do_tiling)) {
         if (ctx->prealloc_x_need_sync) {
             ggml_vk_sync_buffers(ctx, subctx);
         }
@@ -7563,7 +7592,9 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     if (x_non_contig) {
         ggml_vk_cpy_to_contiguous(ctx, subctx, to_fp16_vk_0, src0, ggml_vk_subbuffer(ctx, d_Qx, qx_buf_offset), ggml_vk_subbuffer(ctx, d_X, 0));
-    } else if (qx_needs_dequant) {
+    } else if (qx_needs_dequant && !do_tiling) {
+        // Full-matrix dequant: only used when NOT tiling (when tiling, per-tile dequant
+        // is done inside ggml_vk_matmul_tiling to avoid the large descriptor binding).
         const std::vector<uint32_t> pc = { (uint32_t)ne01, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)(ggml_nelements(src0)) };
         ggml_vk_dispatch_pipeline(ctx, subctx, to_fp16_vk_0, { vk_subbuffer{ d_Qx, qx_buf_offset, qx_sz }, vk_subbuffer{ d_X, 0, x_sz } }, pc, { (uint32_t)(x_ne), 1, 1});
         ggml_vk_sync_buffers(ctx, subctx);
@@ -7611,12 +7642,25 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         GGML_ASSERT(ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1);
         GGML_ASSERT(split_k <= 1);
 
-        ggml_vk_matmul_tiling(
-            ctx, subctx, pipeline,
-            ne00, ne01, ne10, ne11, ne20,
-            a_type, b_type, d_type, tile_m, tile_n,
-            d_X, x_buf_offset, d_Y, y_buf_offset, d_D, d_buf_offset
-        );
+        // When qx_needs_dequant, pass the raw quantized buffer and dequant pipeline so
+        // each tile is dequantized directly into prealloc_tile, avoiding any large
+        // (>128MB) SSBO descriptor binding on Adreno.
+        if (qx_needs_dequant) {
+            ggml_vk_matmul_tiling(
+                ctx, subctx, pipeline,
+                ne00, ne01, ne10, ne11, ne20,
+                a_type, b_type, d_type, tile_m, tile_n,
+                d_X, x_buf_offset, d_Y, y_buf_offset, d_D, d_buf_offset,
+                to_fp16_vk_0, d_Qx, qx_buf_offset, src0->type
+            );
+        } else {
+            ggml_vk_matmul_tiling(
+                ctx, subctx, pipeline,
+                ne00, ne01, ne10, ne11, ne20,
+                a_type, b_type, d_type, tile_m, tile_n,
+                d_X, x_buf_offset, d_Y, y_buf_offset, d_D, d_buf_offset
+            );
+        }
     } else {
         ggml_vk_matmul(
             ctx, subctx, pipeline,
@@ -13198,7 +13242,15 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
             memset(mset.dst, mset.val, mset.n);
         }
 
-        if (almost_ready && !ctx->almost_ready_fence_pending) {
+        if (ctx->device->architecture == vk_device_architecture::QUALCOMM_ADRENO) {
+            // On Adreno, wait synchronously after every submit to prevent GPU monopolization.
+            // Submitting between complete operations (at node boundaries) is safe and does not
+            // cause the 0% accuracy corruption that mid-operation tiling submits do.
+            ggml_vk_submit(subctx, ctx->almost_ready_fence);
+            VK_CHECK(ctx->device->device.waitForFences({ ctx->almost_ready_fence }, true, UINT64_MAX), "adreno_pace_fence");
+            ctx->device->device.resetFences({ ctx->almost_ready_fence });
+            // almost_ready_fence_pending stays false: we've already waited and reset the fence.
+        } else if (almost_ready && !ctx->almost_ready_fence_pending) {
             ggml_vk_submit(subctx, ctx->almost_ready_fence);
             ctx->almost_ready_fence_pending = true;
         } else {
@@ -14136,12 +14188,17 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     // Estimate the amount of matmul work by looking at the weight matrix size, and submit every 100MB
     // (and scaled down based on model size, so smaller models submit earlier).
     // Also submit at least every 100 nodes, in case there are workloads without as much matmul.
-    int nodes_per_submit = 100;
+    //
+    // On Adreno, disable pipelining entirely: submit and synchronously wait after every node.
+    // Without this, the GPU runs flat-out for potentially seconds at a time, triggering the
+    // driver watchdog (DeviceLost) and causing severe system UI hangs.
+    const bool adreno_pace = ctx->device->architecture == vk_device_architecture::QUALCOMM_ADRENO;
+    int nodes_per_submit = adreno_pace ? 1 : 100;
     int submitted_nodes = 0;
     int submit_count = 0;
     uint64_t mul_mat_bytes = 0;
     uint64_t total_mul_mat_bytes = 0;
-    uint64_t mul_mat_bytes_per_submit = std::min(uint64_t(100*1000*1000), ctx->last_total_mul_mat_bytes / 40u);
+    uint64_t mul_mat_bytes_per_submit = adreno_pace ? 0 : std::min(uint64_t(100*1000*1000), ctx->last_total_mul_mat_bytes / 40u);
     for (int i = 0; i < cgraph->n_nodes; i++) {
         if (first_node_in_batch) {
             submit_node_idx = i;
