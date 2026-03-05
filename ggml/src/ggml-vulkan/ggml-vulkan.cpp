@@ -4691,10 +4691,6 @@ static vk_device ggml_vk_get_device(size_t idx) {
             // despite being able to allocate large buffers, using them for SSBOs cause problems
             // on Adreno GPUs, so we need to tile larger operations.
             device->tiling_threshold = descriptor_buffer_props.descriptorBufferAddressSpaceSize;
-            fprintf(stderr, "[TILING_DEBUG] tiling_threshold = %lu (%.2f MB), descriptor_buffer_address_space = %lu\n",
-                (unsigned long)device->tiling_threshold,
-                (double)device->tiling_threshold / (1024.0 * 1024.0),
-                (unsigned long)descriptor_buffer_props.descriptorBufferAddressSpaceSize);
         }
         device->uma = device->properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
         if (sm_builtins) {
@@ -7001,11 +6997,12 @@ static void ggml_vk_copy_2d_to_2d_pre_compute_barrier(vk_context& subctx, vk_buf
         0, 0, nullptr, 1, &barrier, 0, nullptr);
 }
 
-static void ggml_vk_copy_2d_to_2d(vk_context& subctx, vk_buffer& dst, size_t dst_offset, vk_buffer& src, size_t src_offset, size_t width, size_t height, size_t spitch, size_t dpitch) {
+static void ggml_vk_copy_2d_to_2d(vk_context& subctx, vk_buffer& dst, size_t dst_offset, vk_buffer& src, size_t src_offset, size_t width, size_t height, size_t spitch, size_t dpitch, bool flush = true) {
     VK_LOG_DEBUG("ggml_vk_copy_2d_to_2d(dst=" << dst << ", dst_offset=" << dst_offset
             << ", src=" << src << ", src_offset=" << src_offset
             << ", width=" << width << ", height=" << height
             << ", spitch=" << spitch << ", dpitch=" << dpitch
+            << ", flush=" << flush
             << ", multi_device=" << (src->device != dst->device) << ")");
 
     size_t src_total_size = src_offset + (height - 1) * spitch + width;
@@ -7021,7 +7018,7 @@ static void ggml_vk_copy_2d_to_2d(vk_context& subctx, vk_buffer& dst, size_t dst
 
         ggml_vk_buffer_copy(src->device->sync_staging, 0, src, src_offset, src_total_size);
         memcpy(dst->device->sync_staging->info.pMappedData, src->device->sync_staging->info.pMappedData, src_total_size);
-        ggml_vk_copy_2d_to_2d(subctx, dst->device->sync_staging, dst_offset, src->device->sync_staging, 0, width, height, spitch, dpitch);
+        ggml_vk_copy_2d_to_2d(subctx, dst->device->sync_staging, dst_offset, src->device->sync_staging, 0, width, height, spitch, dpitch, flush);
         return;
     }
 
@@ -7029,7 +7026,11 @@ static void ggml_vk_copy_2d_to_2d(vk_context& subctx, vk_buffer& dst, size_t dst
 
     std::lock_guard<std::recursive_mutex> guard(src->device->mutex);
 
-    int group_size = dst->device->architecture == vk_device_architecture::QUALCOMM_ADRENO ? 256 : height;
+    // When flush=false, record all copy commands in a single batch without
+    // submitting. This keeps everything in one command buffer, which is
+    // required when copies are interleaved with compute dispatches (e.g.
+    // during tiling) on Adreno GPUs where mid-graph submits corrupt state.
+    int group_size = (!flush || dst->device->architecture != vk_device_architecture::QUALCOMM_ADRENO) ? (int)height : 256;
     int groups = CEIL_DIV(height, group_size);
 
     for (int i = 0; i < groups; i++) {
@@ -7046,12 +7047,14 @@ static void ggml_vk_copy_2d_to_2d(vk_context& subctx, vk_buffer& dst, size_t dst
         }
         vkCmdCopyBuffer(subctx->s->buffer, (VkBuffer)src->buffer, (VkBuffer)dst->buffer, copy_regions.size(), copy_regions.data());
 
-        ggml_vk_ctx_end(subctx);
-        ggml_vk_submit(subctx, src->device->fence);
-        VK_CHECK(src->device->device.waitForFences({ src->device->fence }, true, UINT64_MAX), "vk wait");
-        src->device->device.resetFences({ src->device->fence });
-        ggml_vk_command_pool_cleanup(src->device, *subctx->p);
-        ggml_vk_ctx_begin(src->device, subctx);
+        if (flush) {
+            ggml_vk_ctx_end(subctx);
+            ggml_vk_submit(subctx, src->device->fence);
+            VK_CHECK(src->device->device.waitForFences({ src->device->fence }, true, UINT64_MAX), "vk wait");
+            src->device->device.resetFences({ src->device->fence });
+            ggml_vk_command_pool_cleanup(src->device, *subctx->p);
+            ggml_vk_ctx_begin(src->device, subctx);
+        }
     }
 }
 
@@ -7139,8 +7142,6 @@ static void ggml_vk_matmul_tiling(ggml_backend_vk_context *ctx, vk_context& subc
     uint32_t d_bytes_per_block = ggml_type_size(d_type);
     uint32_t d_elems_per_block = ggml_blck_size(d_type);
 
-    static int tile_detail_count = 0;
-
     for (uint32_t n0 = 0; n0 < ne11; n0 += tile_n) {
         const uint32_t nt = (uint32_t) std::min(tile_n, ne11 - n0);
         const uint64_t b_off_bytes = y_buf_offset + CEIL_DIV(((uint64_t)n0 * (uint64_t)ne10), b_elems_per_block) * (uint64_t)b_bytes_per_block;
@@ -7155,19 +7156,8 @@ static void ggml_vk_matmul_tiling(ggml_backend_vk_context *ctx, vk_context& subc
         const uint64_t b_size_bytes = tile_stride_b_bytes * nt;
         const uint64_t b_off = 0;
 
-        if (tile_detail_count < 5) {
-            fprintf(stderr, "[TILING_DEBUG] matmul_tiling: n0=%u, nt=%u, b_off_bytes=%lu, d_off_bytes_n=%lu, "
-                "b_k_bytes=%lu, b_size_bytes=%lu, b_off=%lu, "
-                "prealloc_tile_size=%lu, d_Y_size=%lu, d_D_size=%lu, d_X_size=%lu, "
-                "y_buf_offset=%lu, x_buf_offset=%lu, d_buf_offset=%lu\n",
-                n0, nt, (unsigned long)b_off_bytes, (unsigned long)d_off_bytes_n,
-                (unsigned long)b_k_bytes, (unsigned long)b_size_bytes, (unsigned long)b_off,
-                (unsigned long)ctx->prealloc_tile->size, (unsigned long)d_Y->size, (unsigned long)d_D->size, (unsigned long)d_X->size,
-                (unsigned long)y_buf_offset, (unsigned long)x_buf_offset, (unsigned long)d_buf_offset);
-        }
-
         // copy tile b data to buffer b
-        ggml_vk_copy_2d_to_2d(subctx, ctx->prealloc_tile, b_off, d_Y, b_off_bytes, b_k_bytes, nt, orig_stride_b_bytes, tile_stride_b_bytes);
+        ggml_vk_copy_2d_to_2d(subctx, ctx->prealloc_tile, b_off, d_Y, b_off_bytes, b_k_bytes, nt, orig_stride_b_bytes, tile_stride_b_bytes, false);
 
         for (uint32_t m0 = 0; m0 < ne01; m0 += tile_m) {
             const uint32_t mt = (uint32_t) std::min(tile_m, ne01 - m0);
@@ -7193,26 +7183,8 @@ static void ggml_vk_matmul_tiling(ggml_backend_vk_context *ctx, vk_context& subc
             GGML_ASSERT(a_size_bytes + b_size_bytes + d_size_bytes < ctx->device->tiling_threshold);
             GGML_ASSERT(d_off + d_size_bytes < ctx->device->tiling_threshold);
 
-            if (tile_detail_count < 5) {
-                tile_detail_count++;
-                fprintf(stderr, "[TILING_DEBUG]   tile m0=%u, mt=%u, a_off_bytes=%lu, d_off_bytes=%lu, "
-                    "a_k_bytes=%lu, a_size_bytes=%lu, d_size_bytes=%lu, "
-                    "a_off=%lu, d_off=%lu, "
-                    "stride_a_elems=%u, stride_b_elems=%u, stride_d_elems=%u, "
-                    "batch_stride_a=%u, batch_stride_b=%u, batch_stride_d=%u, "
-                    "padded_n_tile=%u, dst_copy_row_size=%lu, "
-                    "orig_stride_d_bytes=%lu, tile_stride_d_bytes=%lu\n",
-                    m0, mt, (unsigned long)a_off_bytes, (unsigned long)d_off_bytes,
-                    (unsigned long)a_k_bytes, (unsigned long)a_size_bytes, (unsigned long)d_size_bytes,
-                    (unsigned long)a_off, (unsigned long)d_off,
-                    tile_stride_a_elems, tile_stride_b_elems, tile_stride_d_elems,
-                    tile_stride_a_elems*mt, tile_stride_b_elems*nt, tile_stride_d_elems*nt,
-                    padded_n_tile, (unsigned long)dst_copy_row_size,
-                    (unsigned long)orig_stride_d_bytes, (unsigned long)tile_stride_d_bytes);
-            }
-
             // copy tile a data to buffer a
-            ggml_vk_copy_2d_to_2d(subctx, ctx->prealloc_tile, a_off, d_X, a_off_bytes, a_k_bytes, mt, orig_stride_a_bytes, tile_stride_a_bytes);
+            ggml_vk_copy_2d_to_2d(subctx, ctx->prealloc_tile, a_off, d_X, a_off_bytes, a_k_bytes, mt, orig_stride_a_bytes, tile_stride_a_bytes, false);
             ggml_vk_copy_2d_to_2d_pre_compute_barrier(subctx, ctx->prealloc_tile, 0, a_size_bytes + b_size_bytes);
 
             // call matmul for the tile
@@ -7228,7 +7200,7 @@ static void ggml_vk_matmul_tiling(ggml_backend_vk_context *ctx, vk_context& subc
 
             // copy results back to dst buffer
             ggml_vk_copy_2d_to_2d_post_compute_barrier(subctx, ctx->prealloc_tile, d_off, d_size_bytes);
-            ggml_vk_copy_2d_to_2d(subctx, d_D, d_off_bytes, ctx->prealloc_tile, d_off, dst_copy_row_size, nt, tile_stride_d_bytes, orig_stride_d_bytes);
+            ggml_vk_copy_2d_to_2d(subctx, d_D, d_off_bytes, ctx->prealloc_tile, d_off, dst_copy_row_size, nt, tile_stride_d_bytes, orig_stride_d_bytes, false);
 
             ggml_vk_sync_buffers(ctx, subctx);
         }
@@ -7285,35 +7257,8 @@ static void ggml_vk_out_prod_tiling(
         }
         const size_t b_height = src1_transposed ? nt : ne11;
 
-        // copy b tile
-        ggml_vk_copy_2d_to_2d(subctx, ctx->prealloc_tile, b_off, d_Y, b_off_bytes, b_nt_bytes, b_height, orig_stride_b_bytes, tile_stride_b_bytes);
-
-        // CPU-side validation of B copy (after submit+fence on Adreno)
-        {
-            static int b_validate_count = 0;
-            if (b_validate_count < 2 && d_Y->info.pMappedData && ctx->prealloc_tile->info.pMappedData) {
-                b_validate_count++;
-                const char* src_ptr = (const char*)d_Y->info.pMappedData + b_off_bytes;
-                const char* tile_ptr = (const char*)ctx->prealloc_tile->info.pMappedData + b_off;
-                size_t check_size = std::min<size_t>(b_size, 1024);
-                int mismatches = 0;
-                for (size_t i = 0; i < check_size; i++) {
-                    if (tile_ptr[i] != src_ptr[i]) mismatches++;
-                }
-                // Also check last 1024 bytes
-                int tail_mismatches = 0;
-                size_t tail_start = b_size > 1024 ? b_size - 1024 : 0;
-                for (size_t i = tail_start; i < b_size; i++) {
-                    if (tile_ptr[i] != src_ptr[i]) tail_mismatches++;
-                }
-                const float* sf = (const float*)src_ptr;
-                const float* tf = (const float*)tile_ptr;
-                fprintf(stderr, "[COPY_VALIDATE] B: head_mismatches=%d/%zu tail_mismatches=%d total_bytes=%lu\n",
-                    mismatches, check_size, tail_mismatches, (unsigned long)b_size);
-                fprintf(stderr, "[COPY_VALIDATE] B src  first4: %.8f %.8f %.8f %.8f\n", sf[0], sf[1], sf[2], sf[3]);
-                fprintf(stderr, "[COPY_VALIDATE] B tile first4: %.8f %.8f %.8f %.8f\n", tf[0], tf[1], tf[2], tf[3]);
-            }
-        }
+        // copy b tile (flush=false: keep in same command buffer)
+        ggml_vk_copy_2d_to_2d(subctx, ctx->prealloc_tile, b_off, d_Y, b_off_bytes, b_nt_bytes, b_height, orig_stride_b_bytes, tile_stride_b_bytes, false);
 
         for (uint32_t m0 = 0; m0 < ne00; m0 += tile_m) {
             const uint32_t mt = (uint32_t) std::min(tile_m, ne00 - m0);
@@ -7340,35 +7285,8 @@ static void ggml_vk_out_prod_tiling(
 
             GGML_ASSERT(ne01 == ne11);
 
-            // copy a tile
-            ggml_vk_copy_2d_to_2d(subctx, ctx->prealloc_tile, a_off, d_X, a_off_bytes, a_mt_bytes, ne01, orig_stride_a_bytes, tile_stride_a_bytes);
-
-            // CPU-side validation of A copy
-            {
-                static int a_validate_count = 0;
-                if (a_validate_count < 2 && d_X->info.pMappedData && ctx->prealloc_tile->info.pMappedData) {
-                    a_validate_count++;
-                    const char* src_ptr = (const char*)d_X->info.pMappedData + a_off_bytes;
-                    const char* tile_ptr = (const char*)ctx->prealloc_tile->info.pMappedData + a_off;
-                    size_t check_size = std::min<size_t>(a_size, 1024);
-                    int mismatches = 0;
-                    for (size_t i = 0; i < check_size; i++) {
-                        if (tile_ptr[i] != src_ptr[i]) mismatches++;
-                    }
-                    int tail_mismatches = 0;
-                    size_t tail_start = a_size > 1024 ? a_size - 1024 : 0;
-                    for (size_t i = tail_start; i < a_size; i++) {
-                        if (tile_ptr[i] != src_ptr[i]) tail_mismatches++;
-                    }
-                    fprintf(stderr, "[COPY_VALIDATE] A: head_mismatches=%d/%zu tail_mismatches=%d total_bytes=%lu\n",
-                        mismatches, check_size, tail_mismatches, (unsigned long)a_size);
-                    // Print first 4 raw uint32s (q4_0 blocks)
-                    const uint32_t* su = (const uint32_t*)src_ptr;
-                    const uint32_t* tu = (const uint32_t*)tile_ptr;
-                    fprintf(stderr, "[COPY_VALIDATE] A src  first4u32: 0x%08x 0x%08x 0x%08x 0x%08x\n", su[0], su[1], su[2], su[3]);
-                    fprintf(stderr, "[COPY_VALIDATE] A tile first4u32: 0x%08x 0x%08x 0x%08x 0x%08x\n", tu[0], tu[1], tu[2], tu[3]);
-                }
-            }
+            // copy a tile (flush=false: keep in same command buffer)
+            ggml_vk_copy_2d_to_2d(subctx, ctx->prealloc_tile, a_off, d_X, a_off_bytes, a_mt_bytes, ne01, orig_stride_a_bytes, tile_stride_a_bytes, false);
 
             std::array<uint32_t, 3> elements;
 
@@ -7381,19 +7299,15 @@ static void ggml_vk_out_prod_tiling(
                 elements = { ne, 1, 1 };
             }
 
-            // update push constants
-
-            // num elements in tile
+            // update push constants for tile dimensions
             pc.ne = mt * nt;
 
-            // src0 (a)
             pc.ne00 = mt; pc.ne01 = ne01;
             pc.nb00 = pc.nb00;
             pc.nb01 = mt / a_elems_per_block;
             pc.nb02 = pc.nb01 * pc.ne01;
             pc.nb03 = pc.nb02 * pc.ne02;
 
-            // src1 (b)
             pc.ne10 = nt; pc.ne11 = ne11;
             if (src1_transposed) {
                 pc.nb10 = pc.nb11 * pc.ne11;
@@ -7403,7 +7317,6 @@ static void ggml_vk_out_prod_tiling(
             pc.nb12 = pc.nb11 * pc.ne11;
             pc.nb13 = pc.nb12 * pc.ne12;
 
-            // dst (d)
             pc.ne20 = mt; pc.ne21 = nt;
             pc.nb20 = pc.nb20;
             pc.nb21 = pc.nb20 * pc.ne20;
@@ -7412,33 +7325,6 @@ static void ggml_vk_out_prod_tiling(
 
             ggml_vk_copy_2d_to_2d_pre_compute_barrier(subctx, ctx->prealloc_tile, 0, a_size + b_size);
 
-            {
-                static int tile_diag_count = 0;
-                if (tile_diag_count < 10) {
-                    tile_diag_count++;
-                    fprintf(stderr, "[TILE_PC] m0=%u n0=%u mt=%u nt=%u REWRITTEN PC: ne=%u "
-                        "ne00=%u ne01=%u ne02=%u ne03=%u nb00=%u nb01=%u nb02=%u nb03=%u "
-                        "ne10=%u ne11=%u ne12=%u ne13=%u nb10=%u nb11=%u nb12=%u nb13=%u "
-                        "ne20=%u ne21=%u ne22=%u ne23=%u nb20=%u nb21=%u nb22=%u nb23=%u "
-                        "misalign=0x%08x "
-                        "a_off=%lu a_sz=%lu b_off=%lu b_sz=%lu d_off=%lu d_sz=%lu "
-                        "elements={%u,%u,%u}\n",
-                        m0, n0, mt, nt,
-                        pc.ne,
-                        pc.ne00, pc.ne01, pc.ne02, pc.ne03,
-                        pc.nb00, pc.nb01, pc.nb02, pc.nb03,
-                        pc.ne10, pc.ne11, pc.ne12, pc.ne13,
-                        pc.nb10, pc.nb11, pc.nb12, pc.nb13,
-                        pc.ne20, pc.ne21, pc.ne22, pc.ne23,
-                        pc.nb20, pc.nb21, pc.nb22, pc.nb23,
-                        pc.misalign_offsets,
-                        (unsigned long)a_off, (unsigned long)a_size,
-                        (unsigned long)b_off, (unsigned long)b_size,
-                        (unsigned long)d_off, (unsigned long)d_size,
-                        elements[0], elements[1], elements[2]);
-                }
-            }
-
             vk_subbuffer a = { ctx->prealloc_tile, a_off, a_size };
             vk_subbuffer b = { ctx->prealloc_tile, b_off, b_size };
             vk_subbuffer d = { ctx->prealloc_tile, d_off, d_size };
@@ -7446,7 +7332,7 @@ static void ggml_vk_out_prod_tiling(
 
             // Copy results back to dst buffer
             ggml_vk_copy_2d_to_2d_post_compute_barrier(subctx, ctx->prealloc_tile, d_off, d_size);
-            ggml_vk_copy_2d_to_2d(subctx, d_D, d_off_bytes, ctx->prealloc_tile, d_off, dst_copy_row_size, nt, tile_stride_d_bytes, orig_stride_d_bytes);
+            ggml_vk_copy_2d_to_2d(subctx, d_D, d_off_bytes, ctx->prealloc_tile, d_off, dst_copy_row_size, nt, tile_stride_d_bytes, orig_stride_d_bytes, false);
 
             ggml_vk_sync_buffers(ctx, subctx);
         }
@@ -7579,34 +7465,10 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         (ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) &&
         (x_sz + y_sz + d_sz >= ctx->device->tiling_threshold);
 
-    {
-        static int tiling_debug_count = 0;
-        if (tiling_debug_count < 20) {
-            tiling_debug_count++;
-            fprintf(stderr, "[TILING_DEBUG] mul_mat: do_tiling=%d, is_adreno=%d, batch1=%d, "
-                "x_sz=%lu, y_sz=%lu, d_sz=%lu, total=%lu, threshold=%lu, "
-                "ne00=%lu, ne01=%lu, ne10=%lu, ne11=%lu, ne02=%lu, ne03=%lu, ne12=%lu, ne13=%lu, "
-                "src0_type=%s, src1_type=%s, qx_needs_dequant=%d, qy_needs_dequant=%d, quantize_y=%d, "
-                "pipeline=%s, split_k=%u, ne20=%lu, stride_d=%u\n",
-                (int)do_tiling,
-                (int)(ctx->device->architecture == vk_device_architecture::QUALCOMM_ADRENO),
-                (int)(ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1),
-                (unsigned long)x_sz, (unsigned long)y_sz, (unsigned long)d_sz,
-                (unsigned long)(x_sz + y_sz + d_sz), (unsigned long)ctx->device->tiling_threshold,
-                (unsigned long)ne00, (unsigned long)ne01, (unsigned long)ne10, (unsigned long)ne11,
-                (unsigned long)ne02, (unsigned long)ne03, (unsigned long)ne12, (unsigned long)ne13,
-                ggml_type_name(src0->type), ggml_type_name(src1->type),
-                (int)qx_needs_dequant, (int)qy_needs_dequant, (int)quantize_y,
-                pipeline->name.c_str(), split_k, (unsigned long)ne20, stride_d);
-        }
-    }
-
     uint64_t tile_m = 0, tile_n = 0, m_tiles = 0, n_tiles = 0, num_dispatches = 1;
     if (do_tiling) {
         GGML_ASSERT(ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1);
         calculate_tile_dims(ctx, ne01, ne11, ne00, &tile_m, &tile_n, &m_tiles, &n_tiles, &num_dispatches);
-        fprintf(stderr, "[TILING_DEBUG] mul_mat tiling: tile_m=%lu, tile_n=%lu, m_tiles=%lu, n_tiles=%lu, num_dispatches=%lu\n",
-            (unsigned long)tile_m, (unsigned long)tile_n, (unsigned long)m_tiles, (unsigned long)n_tiles, (unsigned long)num_dispatches);
         VK_LOG_DEBUG("[ggml_vk_mul_mat_q_f16] [tiling] tile_m="
             << tile_m << ", tile_n=" << tile_n << ", m_tiles=" << m_tiles << ", n_tiles=" << n_tiles
             << ", num_dispatches=" << num_dispatches);
@@ -10155,194 +10017,29 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         break;
     }
 
-    // DIAGNOSTIC: Re-enable OUT_PROD tiling with single-tile mode to isolate the bug.
-    // If single tile works → multi-tile iteration is broken.
-    // If single tile also fails → per-tile logic (copy/compute/copyback) is broken.
     if (op == GGML_OP_OUT_PROD) {
         bool do_tiling = ctx->device->architecture == vk_device_architecture::QUALCOMM_ADRENO &&
             (ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) &&
             ((ggml_nbytes(src0) + ggml_nbytes(src1) + ggml_nbytes(dst)) >= ctx->device->tiling_threshold);
 
         if (do_tiling) {
-            // GGML_VK_OUT_PROD_TILE_MODE:
-            //   0 = bypass (direct dispatch, no tiling — known good)
-            //   1 = single tile through tiling function
-            static int tile_mode = -1;
-            if (tile_mode < 0) {
-                const char *env = getenv("GGML_VK_OUT_PROD_TILE_MODE");
-                tile_mode = env ? atoi(env) : 0;
-                fprintf(stderr, "[OUT_PROD_DIAG] tile_mode=%d (0=bypass, 2=bypass+sync, 3=bypass+full_flush, "
-                    "4=ctx_end+submit_nofence+ctx_begin, 5=ctx_end+submit_fence_wait+ctx_begin, "
-                    "6=ctx_end+submit_fence_wait+cleanup+ctx_begin, "
-                    "7=ctx_end+ctx_begin_NO_SUBMIT, 8=submit+waitIdle, 9=submit+wait+ALL_COMMANDS_barrier, "
-                    "1=single_tile)\n", tile_mode);
+            // For OUT_PROD C[M,N] = A[M,K] * B[K,N]^T:
+            //   m = ne00 (M dim), n = ne10 (N dim), k = ne01 (K/reduction dim)
+            uint64_t tile_m = 0, tile_n = 0, m_tiles = 0, n_tiles = 0, num_dispatches = 1;
+            calculate_tile_dims(ctx, ne00, ne10, ne01, &tile_m, &tile_n, &m_tiles, &n_tiles, &num_dispatches,
+                src0->type, src1->type, dst->type);
+
+            ctx->prealloc_size_tile = ctx->device->tiling_threshold;
+            if (ctx->prealloc_tile == nullptr || ctx->prealloc_tile->size < ctx->prealloc_size_tile) {
+                ggml_vk_preallocate_buffers(ctx, subctx);
             }
 
-            if (tile_mode == 0) {
-                // Bypass: direct dispatch, known correct
-                ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
-            } else if (tile_mode == 2) {
-                // Bypass dispatch + sync_buffers only → WORKS
-                ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
-                ggml_vk_sync_buffers(ctx, subctx);
-            } else if (tile_mode == 4) {
-                // ctx_end + submit (no fence) + ctx_begin (no cleanup)
-                ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
-                ggml_vk_ctx_end(subctx);
-                ggml_vk_submit(subctx, {});  // no fence
-                ggml_vk_ctx_begin(ctx->device, subctx);
-            } else if (tile_mode == 5) {
-                // ctx_end + submit with fence + wait + reset fence + ctx_begin (no cleanup)
-                ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
-                ggml_vk_ctx_end(subctx);
-                ggml_vk_submit(subctx, ctx->device->fence);
-                VK_CHECK(ctx->device->device.waitForFences({ctx->device->fence}, true, UINT64_MAX), "vk_mode5_wait");
-                ctx->device->device.resetFences({ctx->device->fence});
-                ggml_vk_ctx_begin(ctx->device, subctx);
-            } else if (tile_mode == 6) {
-                // ctx_end + submit with fence + wait + reset fence + cleanup + ctx_begin (full cycle)
-                ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
-                ggml_vk_ctx_end(subctx);
-                ggml_vk_submit(subctx, ctx->device->fence);
-                VK_CHECK(ctx->device->device.waitForFences({ctx->device->fence}, true, UINT64_MAX), "vk_mode6_wait");
-                ctx->device->device.resetFences({ctx->device->fence});
-                ggml_vk_command_pool_cleanup(ctx->device, *subctx->p);
-                ggml_vk_ctx_begin(ctx->device, subctx);
-            } else if (tile_mode == 3) {
-                // Full cycle + sync_buffers → BROKEN
-                ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
-                ggml_vk_ctx_end(subctx);
-                ggml_vk_submit(subctx, ctx->device->fence);
-                VK_CHECK(ctx->device->device.waitForFences({ctx->device->fence}, true, UINT64_MAX), "vk_mode3_wait");
-                ctx->device->device.resetFences({ctx->device->fence});
-                ggml_vk_command_pool_cleanup(ctx->device, *subctx->p);
-                ggml_vk_ctx_begin(ctx->device, subctx);
-                ggml_vk_sync_buffers(ctx, subctx);
-            } else if (tile_mode == 7) {
-                // ctx_end + ctx_begin ONLY (no submit) — tests if splitting the CB recording alone causes issues
-                ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
-                ggml_vk_ctx_end(subctx);
-                // NOTE: seqs still has the ended sequence (not submitted/cleared)
-                // ctx_begin will add a NEW sequence, so seqs will have TWO entries
-                ggml_vk_ctx_begin(ctx->device, subctx);
-            } else if (tile_mode == 8) {
-                // bypass dispatch + queueWaitIdle (NO CB split, just force GPU completion)
-                ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
-                // Don't split the CB — just flush the GPU pipeline and wait
-                // This tests if CPU-side waiting (without CB split) causes issues
-                ggml_vk_ctx_end(subctx);
-                ggml_vk_submit(subctx, {});
-                ctx->device->device.waitIdle();
-                ggml_vk_ctx_begin(ctx->device, subctx);
-            } else if (tile_mode == 9) {
-                // bypass dispatch + submit(fence) + wait + ctx_begin + aggressive ALL_COMMANDS barrier
-                ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
-                ggml_vk_ctx_end(subctx);
-                ggml_vk_submit(subctx, ctx->device->fence);
-                VK_CHECK(ctx->device->device.waitForFences({ctx->device->fence}, true, UINT64_MAX), "vk_mode9_wait");
-                ctx->device->device.resetFences({ctx->device->fence});
-                ggml_vk_ctx_begin(ctx->device, subctx);
-                // Maximum barrier: ALL_COMMANDS with MEMORY_READ|MEMORY_WRITE
-                subctx->s->buffer.pipelineBarrier(
-                    vk::PipelineStageFlagBits::eAllCommands,
-                    vk::PipelineStageFlagBits::eAllCommands,
-                    {},
-                    { { vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
-                        vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite } },
-                    {},
-                    {}
-                );
-            } else if (tile_mode == 1) {
-                // Single tile through tiling function
-                uint64_t tile_m = ne00;
-                uint64_t tile_n = ne10;
+            auto pc_bin = *reinterpret_cast<const vk_op_binary_push_constants*>(&pc);
 
-                uint64_t a_sz = CEIL_DIV(ne00 * ne01, ggml_blck_size(src0->type)) * ggml_type_size(src0->type);
-                uint64_t b_sz = CEIL_DIV(ne10 * ne11, ggml_blck_size(src1->type)) * ggml_type_size(src1->type);
-                uint64_t d_sz = ne00 * ne10 * ggml_type_size(dst->type);
-                ctx->prealloc_size_tile = a_sz + b_sz + d_sz + 4096;
-
-                auto pc_bin = *reinterpret_cast<const vk_op_binary_push_constants*>(&pc);
-
-                {
-                    static int debug_count = 0;
-                    if (debug_count < 10) {
-                        debug_count++;
-                        // Print BOTH the push constants that bypass would use, and what tiling will rewrite
-                        fprintf(stderr, "[OUT_PROD_DIAG] ORIGINAL PC: ne=%u "
-                            "ne00=%u ne01=%u ne02=%u ne03=%u nb00=%u nb01=%u nb02=%u nb03=%u "
-                            "ne10=%u ne11=%u ne12=%u ne13=%u nb10=%u nb11=%u nb12=%u nb13=%u "
-                            "ne20=%u ne21=%u ne22=%u ne23=%u nb20=%u nb21=%u nb22=%u nb23=%u "
-                            "misalign=0x%08x param1=%f param2=%f param3=%d\n",
-                            pc_bin.ne,
-                            pc_bin.ne00, pc_bin.ne01, pc_bin.ne02, pc_bin.ne03,
-                            pc_bin.nb00, pc_bin.nb01, pc_bin.nb02, pc_bin.nb03,
-                            pc_bin.ne10, pc_bin.ne11, pc_bin.ne12, pc_bin.ne13,
-                            pc_bin.nb10, pc_bin.nb11, pc_bin.nb12, pc_bin.nb13,
-                            pc_bin.ne20, pc_bin.ne21, pc_bin.ne22, pc_bin.ne23,
-                            pc_bin.nb20, pc_bin.nb21, pc_bin.nb22, pc_bin.nb23,
-                            pc_bin.misalign_offsets,
-                            pc_bin.param1, pc_bin.param2, pc_bin.param3);
-                        fprintf(stderr, "[OUT_PROD_DIAG] src0_buf: buffer=%p offset=%lu size=%lu\n",
-                            (void*)src0_buf.buffer.get(), (unsigned long)src0_buf.offset, (unsigned long)src0_buf.size);
-                        fprintf(stderr, "[OUT_PROD_DIAG] src1_buf: buffer=%p offset=%lu size=%lu\n",
-                            (void*)src1_buf.buffer.get(), (unsigned long)src1_buf.offset, (unsigned long)src1_buf.size);
-                        fprintf(stderr, "[OUT_PROD_DIAG] dst_buf:  buffer=%p offset=%lu size=%lu\n",
-                            (void*)dst_buf.buffer.get(), (unsigned long)dst_buf.offset, (unsigned long)dst_buf.size);
-                    }
-                }
-
-                if (ctx->prealloc_tile == nullptr || ctx->prealloc_tile->size < ctx->prealloc_size_tile) {
-                    ggml_vk_preallocate_buffers(ctx, subctx);
-                }
-
-                ggml_vk_out_prod_tiling(ctx, subctx, pipeline, pc_bin, ne00, ne01, ne10, ne11, dst->ne[0],
-                    src0->type, src1->type, dst->type, tile_m, tile_n,
-                    src0_buf.buffer, src0_buf.offset, src1_buf.buffer, src1_buf.offset, dst_buf.buffer, dst_buf.offset,
-                    ggml_is_transposed(src1), ggml_nelements(dst));
-
-                // Validate tiling output (GPU work already flushed by tiling function)
-                {
-                    static int tiling_validate_count = 0;
-                    if (tiling_validate_count < 2) {
-                        tiling_validate_count++;
-                        if (dst_buf.buffer->info.pMappedData) {
-                            const float* out = (const float*)((const char*)dst_buf.buffer->info.pMappedData + dst_buf.offset);
-                            uint32_t nout = ggml_nelements(dst);
-                            double sum = 0; int nans = 0; int infs = 0; int zeros = 0;
-                            for (uint32_t i = 0; i < nout; i++) {
-                                if (std::isnan(out[i])) nans++;
-                                else if (std::isinf(out[i])) infs++;
-                                else { sum += out[i]; if (out[i] == 0.0f) zeros++; }
-                            }
-                            fprintf(stderr, "[D_VALIDATE] TILING output: nout=%u sum=%.6f nans=%d infs=%d zeros=%d\n",
-                                nout, sum, nans, infs, zeros);
-                            fprintf(stderr, "[D_VALIDATE] TILING first8: %.8f %.8f %.8f %.8f %.8f %.8f %.8f %.8f\n",
-                                out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7]);
-                            fprintf(stderr, "[D_VALIDATE] TILING last4: %.8f %.8f %.8f %.8f\n",
-                                out[nout-4], out[nout-3], out[nout-2], out[nout-1]);
-                            
-                            // Also check tile D buffer before copy-back to see if compute result is correct
-                            if (ctx->prealloc_tile->info.pMappedData) {
-                                uint64_t b_sz_check = CEIL_DIV(ne10 * ne11, ggml_blck_size(src1->type)) * ggml_type_size(src1->type);
-                                uint64_t a_sz_check = CEIL_DIV(ne00 * ne01, ggml_blck_size(src0->type)) * ggml_type_size(src0->type);
-                                uint64_t d_off_check = a_sz_check + b_sz_check;
-                                const float* tile_d = (const float*)((const char*)ctx->prealloc_tile->info.pMappedData + d_off_check);
-                                double tile_sum = 0; int tile_nans = 0;
-                                uint32_t d_sz_elems = ne00 * ne10;
-                                for (uint32_t i = 0; i < d_sz_elems; i++) {
-                                    if (std::isnan(tile_d[i])) tile_nans++;
-                                    else tile_sum += tile_d[i];
-                                }
-                                fprintf(stderr, "[D_VALIDATE] TILE_D (pre-copyback): sum=%.6f nans=%d first4: %.8f %.8f %.8f %.8f\n",
-                                    tile_sum, tile_nans, tile_d[0], tile_d[1], tile_d[2], tile_d[3]);
-                            }
-                        } else {
-                            fprintf(stderr, "[D_VALIDATE] TILING: dst buffer not mapped!\n");
-                        }
-                    }
-                }
-            }
+            ggml_vk_out_prod_tiling(ctx, subctx, pipeline, pc_bin, ne00, ne01, ne10, ne11, dst->ne[0],
+                src0->type, src1->type, dst->type, tile_m, tile_n,
+                src0_buf.buffer, src0_buf.offset, src1_buf.buffer, src1_buf.offset, dst_buf.buffer, dst_buf.offset,
+                ggml_is_transposed(src1), ggml_nelements(dst));
         } else {
             ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
         }
@@ -12969,8 +12666,6 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
             ggml_vk_destroy_buffer(ctx->prealloc_tile);
         }
         ctx->prealloc_tile = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_tile);
-        fprintf(stderr, "[TILING_DEBUG] allocated prealloc_tile: size=%lu (%.2f MB)\n",
-            (unsigned long)ctx->prealloc_tile->size, (double)ctx->prealloc_tile->size / (1024.0 * 1024.0));
     }
 }
 
