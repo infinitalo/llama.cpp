@@ -7124,6 +7124,20 @@ static void calculate_tile_dims(ggml_backend_vk_context * ctx,
     *num_dispatches = (*m_tiles) * (*n_tiles);
 }
 
+// Broadest possible Vulkan barrier: ALL_COMMANDS on both sides, MEMORY_READ|MEMORY_WRITE
+// global memory barrier (no buffer/range restriction). Used to completely rule out any
+// Adreno cache/barrier bug when diagnosing tiling correctness.
+static void ggml_vk_nuke_barrier(vk_context& subctx) {
+    VkMemoryBarrier mb{};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    vkCmdPipelineBarrier(subctx->s->buffer,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        0, 1, &mb, 0, nullptr, 0, nullptr);
+}
+
 // When dequant_a_pipeline is non-null, src A is raw-quantized (raw_a_type) and is dequantized
 // per-tile directly into prealloc_tile, bypassing the full-matrix dequant dispatch that would
 // bind a descriptor larger than the Adreno 128MB descriptor buffer address space limit.
@@ -7166,7 +7180,9 @@ static void ggml_vk_matmul_tiling(ggml_backend_vk_context *ctx, vk_context& subc
         const uint64_t b_off = 0;
 
         // copy tile b data to buffer b
+        ggml_vk_nuke_barrier(subctx);
         ggml_vk_copy_2d_to_2d(subctx, ctx->prealloc_tile, b_off, d_Y, b_off_bytes, b_k_bytes, nt, orig_stride_b_bytes, tile_stride_b_bytes, false);
+        ggml_vk_nuke_barrier(subctx);
 
         for (uint32_t m0 = 0; m0 < ne01; m0 += tile_m) {
             const uint32_t mt = (uint32_t) std::min(tile_m, ne01 - m0);
@@ -7208,9 +7224,10 @@ static void ggml_vk_matmul_tiling(ggml_backend_vk_context *ctx, vk_context& subc
                       vk_subbuffer{ctx->prealloc_tile, a_off, a_size_bytes} },
                     dequant_pc, { (uint32_t)(mt * ne00), 1, 1 });
             } else {
+                ggml_vk_nuke_barrier(subctx);
                 ggml_vk_copy_2d_to_2d(subctx, ctx->prealloc_tile, a_off, d_X, a_off_bytes, a_k_bytes, mt, orig_stride_a_bytes, tile_stride_a_bytes, false);
             }
-            ggml_vk_sync_buffers(ctx, subctx);
+            ggml_vk_nuke_barrier(subctx);
 
             // call matmul for the tile
             ggml_vk_matmul(
@@ -7224,13 +7241,9 @@ static void ggml_vk_matmul_tiling(ggml_backend_vk_context *ctx, vk_context& subc
             );
 
             // copy results back to dst buffer
-            // Use sync_buffers (full global barrier) instead of the targeted post_compute_barrier,
-            // since Adreno does not reliably flush shader write caches for non-zero offsets within
-            // a buffer with the targeted VK_ACCESS_SHADER_WRITE_BIT -> VK_ACCESS_TRANSFER_READ_BIT.
-            ggml_vk_sync_buffers(ctx, subctx);
+            ggml_vk_nuke_barrier(subctx);
             ggml_vk_copy_2d_to_2d(subctx, d_D, d_off_bytes, ctx->prealloc_tile, d_off, dst_copy_row_size, nt, tile_stride_d_bytes, orig_stride_d_bytes, false);
-
-            ggml_vk_sync_buffers(ctx, subctx);
+            ggml_vk_nuke_barrier(subctx);
         }
     }
 }
@@ -7286,7 +7299,9 @@ static void ggml_vk_out_prod_tiling(
         const size_t b_height = src1_transposed ? nt : ne11;
 
         // copy b tile (flush=false: keep in same command buffer)
+        ggml_vk_nuke_barrier(subctx);
         ggml_vk_copy_2d_to_2d(subctx, ctx->prealloc_tile, b_off, d_Y, b_off_bytes, b_nt_bytes, b_height, orig_stride_b_bytes, tile_stride_b_bytes, false);
+        ggml_vk_nuke_barrier(subctx);
 
         for (uint32_t m0 = 0; m0 < ne00; m0 += tile_m) {
             const uint32_t mt = (uint32_t) std::min(tile_m, ne00 - m0);
@@ -7314,7 +7329,9 @@ static void ggml_vk_out_prod_tiling(
             GGML_ASSERT(ne01 == ne11);
 
             // copy a tile (flush=false: keep in same command buffer)
+            ggml_vk_nuke_barrier(subctx);
             ggml_vk_copy_2d_to_2d(subctx, ctx->prealloc_tile, a_off, d_X, a_off_bytes, a_mt_bytes, ne01, orig_stride_a_bytes, tile_stride_a_bytes, false);
+            ggml_vk_nuke_barrier(subctx);
 
             std::array<uint32_t, 3> elements;
 
@@ -7351,9 +7368,7 @@ static void ggml_vk_out_prod_tiling(
             pc.nb22 = pc.nb21 * pc.ne21;
             pc.nb23 = pc.nb22 * pc.ne22;
 
-            // Use sync_buffers (full global barrier) instead of the targeted pre_compute_barrier,
-            // since Adreno does not reliably flush/invalidate caches for ranged buffer barriers.
-            ggml_vk_sync_buffers(ctx, subctx);
+            ggml_vk_nuke_barrier(subctx);
 
             fprintf(stderr, "OUT_PROD_TILE m0=%u mt=%u nt=%u a_off=%zu b_off=%zu d_off=%zu d_size=%zu pc.ne=%u pc.ne00=%u pc.nb01=%u pc.ne20=%u pc.nb21=%u pc.ne10=%u pc.nb10=%u\n",
                 m0, mt, nt, (size_t)a_off, (size_t)b_off, (size_t)d_off, (size_t)d_size,
@@ -7364,14 +7379,9 @@ static void ggml_vk_out_prod_tiling(
             vk_subbuffer d = { ctx->prealloc_tile, d_off, d_size };
             ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d }, pc, elements);
 
-            // Copy results back to dst buffer
-            // Use sync_buffers (full global barrier) instead of the targeted post_compute_barrier,
-            // since Adreno does not reliably flush shader write caches for non-zero offsets within
-            // a buffer with the targeted VK_ACCESS_SHADER_WRITE_BIT -> VK_ACCESS_TRANSFER_READ_BIT.
-            ggml_vk_sync_buffers(ctx, subctx);
+            ggml_vk_nuke_barrier(subctx);
             ggml_vk_copy_2d_to_2d(subctx, d_D, d_off_bytes, ctx->prealloc_tile, d_off, dst_copy_row_size, nt, tile_stride_d_bytes, orig_stride_d_bytes, false);
-
-            ggml_vk_sync_buffers(ctx, subctx);
+            ggml_vk_nuke_barrier(subctx);
         }
     }
 }
