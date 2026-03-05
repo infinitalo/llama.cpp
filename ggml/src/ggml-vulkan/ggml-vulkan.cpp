@@ -7363,21 +7363,8 @@ static void ggml_vk_out_prod_tiling(
             vk_subbuffer d = { ctx->prealloc_tile, d_off, d_size };
             ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d }, pc, elements);
 
-            // On Adreno, explicitly submit and wait for the compute dispatch
-            // to complete before copying results back. This ensures compute
-            // shader writes are fully visible to subsequent transfer reads.
-            if (ctx->device->architecture == vk_device_architecture::QUALCOMM_ADRENO) {
-                ggml_vk_ctx_end(subctx);
-                ggml_vk_submit(subctx, ctx->device->fence);
-                VK_CHECK(ctx->device->device.waitForFences({ ctx->device->fence }, true, UINT64_MAX), "vk wait out_prod compute");
-                ctx->device->device.resetFences({ ctx->device->fence });
-                ggml_vk_command_pool_cleanup(ctx->device, *subctx->p);
-                ggml_vk_ctx_begin(ctx->device, subctx);
-            } else {
-                ggml_vk_copy_2d_to_2d_post_compute_barrier(subctx, ctx->prealloc_tile, d_off, d_size);
-            }
-
             // Copy results back to dst buffer
+            ggml_vk_copy_2d_to_2d_post_compute_barrier(subctx, ctx->prealloc_tile, d_off, d_size);
             ggml_vk_copy_2d_to_2d(subctx, d_D, d_off_bytes, ctx->prealloc_tile, d_off, dst_copy_row_size, nt, tile_stride_d_bytes, orig_stride_d_bytes);
 
             ggml_vk_sync_buffers(ctx, subctx);
@@ -9828,7 +9815,8 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     }
 
     if (op == GGML_OP_OUT_PROD) {
-        ggml_vk_out_prod_request_descriptors(ctx, pipeline, src0, src1, dst);
+        // DIAGNOSTIC: Force 1 descriptor (matching force-disabled tiling)
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     } else {
         ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     }
@@ -10094,18 +10082,21 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     }
 
     if (op == GGML_OP_OUT_PROD) {
-        bool do_tiling = ctx->device->architecture == vk_device_architecture::QUALCOMM_ADRENO &&
+        bool would_tile = ctx->device->architecture == vk_device_architecture::QUALCOMM_ADRENO &&
             (ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) &&
             ((ggml_nbytes(src0) + ggml_nbytes(src1) + ggml_nbytes(dst)) >= ctx->device->tiling_threshold);
+
+        // DIAGNOSTIC: Force-disable OUT_PROD tiling to isolate the bug
+        bool do_tiling = false;
 
         {
             static int out_prod_debug_count = 0;
             if (out_prod_debug_count < 10) {
                 out_prod_debug_count++;
-                fprintf(stderr, "[TILING_DEBUG] OUT_PROD: do_tiling=%d, "
+                fprintf(stderr, "[TILING_DEBUG] OUT_PROD: would_tile=%d, do_tiling=%d (FORCED OFF), "
                     "src0_bytes=%lu, src1_bytes=%lu, dst_bytes=%lu, total=%lu, threshold=%lu, "
                     "ne00=%lu, ne01=%lu, ne10=%lu, ne11=%lu\n",
-                    (int)do_tiling,
+                    (int)would_tile, (int)do_tiling,
                     (unsigned long)ggml_nbytes(src0), (unsigned long)ggml_nbytes(src1), (unsigned long)ggml_nbytes(dst),
                     (unsigned long)(ggml_nbytes(src0) + ggml_nbytes(src1) + ggml_nbytes(dst)),
                     (unsigned long)ctx->device->tiling_threshold,
