@@ -10172,8 +10172,10 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
                 const char *env = getenv("GGML_VK_OUT_PROD_TILE_MODE");
                 tile_mode = env ? atoi(env) : 0;
                 fprintf(stderr, "[OUT_PROD_DIAG] tile_mode=%d (0=bypass, 2=bypass+sync, 3=bypass+full_flush, "
-                    "4=bypass+ctx_end+submit_nofence+ctx_begin, 5=bypass+ctx_end+submit_fence_wait+ctx_begin, "
-                    "6=bypass+ctx_end+submit_fence_wait+cleanup+ctx_begin, 1=single_tile)\n", tile_mode);
+                    "4=ctx_end+submit_nofence+ctx_begin, 5=ctx_end+submit_fence_wait+ctx_begin, "
+                    "6=ctx_end+submit_fence_wait+cleanup+ctx_begin, "
+                    "7=ctx_end+ctx_begin_NO_SUBMIT, 8=submit+waitIdle, 9=submit+wait+ALL_COMMANDS_barrier, "
+                    "1=single_tile)\n", tile_mode);
             }
 
             if (tile_mode == 0) {
@@ -10216,6 +10218,40 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
                 ggml_vk_command_pool_cleanup(ctx->device, *subctx->p);
                 ggml_vk_ctx_begin(ctx->device, subctx);
                 ggml_vk_sync_buffers(ctx, subctx);
+            } else if (tile_mode == 7) {
+                // ctx_end + ctx_begin ONLY (no submit) — tests if splitting the CB recording alone causes issues
+                ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
+                ggml_vk_ctx_end(subctx);
+                // NOTE: seqs still has the ended sequence (not submitted/cleared)
+                // ctx_begin will add a NEW sequence, so seqs will have TWO entries
+                ggml_vk_ctx_begin(ctx->device, subctx);
+            } else if (tile_mode == 8) {
+                // bypass dispatch + queueWaitIdle (NO CB split, just force GPU completion)
+                ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
+                // Don't split the CB — just flush the GPU pipeline and wait
+                // This tests if CPU-side waiting (without CB split) causes issues
+                ggml_vk_ctx_end(subctx);
+                ggml_vk_submit(subctx, {});
+                ctx->device->device.waitIdle();
+                ggml_vk_ctx_begin(ctx->device, subctx);
+            } else if (tile_mode == 9) {
+                // bypass dispatch + submit(fence) + wait + ctx_begin + aggressive ALL_COMMANDS barrier
+                ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
+                ggml_vk_ctx_end(subctx);
+                ggml_vk_submit(subctx, ctx->device->fence);
+                VK_CHECK(ctx->device->device.waitForFences({ctx->device->fence}, true, UINT64_MAX), "vk_mode9_wait");
+                ctx->device->device.resetFences({ctx->device->fence});
+                ggml_vk_ctx_begin(ctx->device, subctx);
+                // Maximum barrier: ALL_COMMANDS with MEMORY_READ|MEMORY_WRITE
+                subctx->s->buffer.pipelineBarrier(
+                    vk::PipelineStageFlagBits::eAllCommands,
+                    vk::PipelineStageFlagBits::eAllCommands,
+                    {},
+                    { { vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+                        vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite } },
+                    {},
+                    {}
+                );
             } else if (tile_mode == 1) {
                 // Single tile through tiling function
                 uint64_t tile_m = ne00;
