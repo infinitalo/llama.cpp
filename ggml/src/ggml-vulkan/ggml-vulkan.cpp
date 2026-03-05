@@ -10171,47 +10171,28 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             if (tile_mode < 0) {
                 const char *env = getenv("GGML_VK_OUT_PROD_TILE_MODE");
                 tile_mode = env ? atoi(env) : 0;
-                fprintf(stderr, "[OUT_PROD_DIAG] tile_mode=%d (0=bypass, 1=single_tile)\n", tile_mode);
+                fprintf(stderr, "[OUT_PROD_DIAG] tile_mode=%d (0=bypass, 1=single_tile, 2=bypass+sync, 3=bypass+copies+sync)\n", tile_mode);
             }
 
             if (tile_mode == 0) {
                 // Bypass: direct dispatch, known correct
                 ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
-
-                // Force flush GPU work and validate output
-                {
-                    static int bypass_validate_count = 0;
-                    if (bypass_validate_count < 2) {
-                        bypass_validate_count++;
-                        // Submit and wait to get the result
-                        ggml_vk_ctx_end(subctx);
-                        ggml_vk_submit(subctx, ctx->device->fence);
-                        VK_CHECK(ctx->device->device.waitForFences({ctx->device->fence}, true, UINT64_MAX), "vk_diag_wait");
-                        ctx->device->device.resetFences({ctx->device->fence});
-                        ggml_vk_command_pool_cleanup(ctx->device, *subctx->p);
-                        ggml_vk_ctx_begin(ctx->device, subctx);
-
-                        if (dst_buf.buffer->info.pMappedData) {
-                            const float* out = (const float*)((const char*)dst_buf.buffer->info.pMappedData + dst_buf.offset);
-                            uint32_t nout = ggml_nelements(dst);
-                            double sum = 0; int nans = 0; int infs = 0; int zeros = 0;
-                            for (uint32_t i = 0; i < nout; i++) {
-                                if (std::isnan(out[i])) nans++;
-                                else if (std::isinf(out[i])) infs++;
-                                else { sum += out[i]; if (out[i] == 0.0f) zeros++; }
-                            }
-                            fprintf(stderr, "[D_VALIDATE] BYPASS output: nout=%u sum=%.6f nans=%d infs=%d zeros=%d\n",
-                                nout, sum, nans, infs, zeros);
-                            fprintf(stderr, "[D_VALIDATE] BYPASS first8: %.8f %.8f %.8f %.8f %.8f %.8f %.8f %.8f\n",
-                                out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7]);
-                            fprintf(stderr, "[D_VALIDATE] BYPASS last4: %.8f %.8f %.8f %.8f\n",
-                                out[nout-4], out[nout-3], out[nout-2], out[nout-1]);
-                        } else {
-                            fprintf(stderr, "[D_VALIDATE] BYPASS: dst buffer not mapped!\n");
-                        }
-                    }
-                }
-            } else {
+            } else if (tile_mode == 2) {
+                // Bypass dispatch + sync_buffers (test if sync_buffers alone causes 0% accuracy)
+                ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
+                ggml_vk_sync_buffers(ctx, subctx);
+            } else if (tile_mode == 3) {
+                // Bypass dispatch + submit/wait/cleanup pattern (test if command buffer disruption causes 0%)
+                ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
+                // Mimic what copy_2d_to_2d does on Adreno:
+                ggml_vk_ctx_end(subctx);
+                ggml_vk_submit(subctx, ctx->device->fence);
+                VK_CHECK(ctx->device->device.waitForFences({ctx->device->fence}, true, UINT64_MAX), "vk_mode3_wait");
+                ctx->device->device.resetFences({ctx->device->fence});
+                ggml_vk_command_pool_cleanup(ctx->device, *subctx->p);
+                ggml_vk_ctx_begin(ctx->device, subctx);
+                ggml_vk_sync_buffers(ctx, subctx);
+            } else if (tile_mode == 1) {
                 // Single tile through tiling function
                 uint64_t tile_m = ne00;
                 uint64_t tile_n = ne10;
