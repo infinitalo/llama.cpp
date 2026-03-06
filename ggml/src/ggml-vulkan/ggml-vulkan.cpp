@@ -7030,7 +7030,29 @@ static void ggml_vk_copy_2d_to_2d(vk_context& subctx, vk_buffer& dst, size_t dst
     // submitting. This keeps everything in one command buffer, which is
     // required when copies are interleaved with compute dispatches (e.g.
     // during tiling) on Adreno GPUs where mid-graph submits corrupt state.
-    int group_size = (!flush || dst->device->architecture != vk_device_architecture::QUALCOMM_ADRENO) ? (int)height : 256;
+
+    // Fast path: if width == spitch == dpitch the data is contiguous — emit
+    // a single region instead of one VkBufferCopy per row.
+    if (width == spitch && width == dpitch) {
+        VkBufferCopy bc{ src_offset, dst_offset, width * height };
+        vkCmdCopyBuffer(subctx->s->buffer, (VkBuffer)src->buffer, (VkBuffer)dst->buffer, 1, &bc);
+        if (flush) {
+            ggml_vk_ctx_end(subctx);
+            ggml_vk_submit(subctx, src->device->fence);
+            VK_CHECK(src->device->device.waitForFences({ src->device->fence }, true, UINT64_MAX), "vk wait");
+            src->device->device.resetFences({ src->device->fence });
+            ggml_vk_command_pool_cleanup(src->device, *subctx->p);
+            ggml_vk_ctx_begin(src->device, subctx);
+        }
+        return;
+    }
+
+    // Cap regions per vkCmdCopyBuffer call on Adreno to avoid overflowing the
+    // driver's internal command buffer allocator with a single massive call.
+    // When flush=true we also submit after each group; when flush=false we keep
+    // everything in the same command buffer but still split into smaller calls.
+    const int max_regions = (dst->device->architecture == vk_device_architecture::QUALCOMM_ADRENO) ? 2048 : (int)height;
+    int group_size = flush ? std::min(max_regions, (int)height) : max_regions;
     int groups = CEIL_DIV(height, group_size);
 
     for (int i = 0; i < groups; i++) {
