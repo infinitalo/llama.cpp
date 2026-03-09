@@ -414,6 +414,14 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     GGML_ASSERT(opt_ctx->ctx_compute && "no compute context set, either use static graphs or set one with ggml_opt_prepare_alloc");
     GGML_ASSERT((!opt_ctx->static_graphs || opt_ctx->inputs->data) && "when using static graphs the inputs must be allocated statically");
 
+    if (!opt_ctx->static_graphs && opt_ctx->buf_static && opt_ctx->opt_i == 0) {
+        for (struct ggml_tensor * g : opt_ctx->grad_accs) {
+            if (g) {
+                ggml_set_zero(g);
+            }
+        }
+    }
+
     const enum ggml_opt_optimizer_type optimizer = opt_ctx->optimizer;
 
     const bool accumulate = opt_ctx->build_type_alloc >= GGML_OPT_BUILD_TYPE_GRAD &&
