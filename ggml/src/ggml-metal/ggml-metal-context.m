@@ -240,8 +240,17 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
             if (status != MTLCommandBufferStatusCompleted) {
                 GGML_LOG_ERROR("%s: error: command buffer %d failed with status %d\n", __func__, cb_idx, (int) status);
                 if (status == MTLCommandBufferStatusError) {
-                    GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
+                    GGML_LOG_ERROR("%s: command buffer error A\n", __func__);
+                    NSError * err = [cmd_buf error];
+                    if (err) {
+                        GGML_LOG_ERROR("%s: error code: %d, domain: %s\n", __func__, (int) err.code, [err.domain UTF8String]);
+                        GGML_LOG_ERROR("%s: error description: %s\n", __func__, [err.localizedDescription UTF8String]);
+                    } else {
+                        GGML_LOG_ERROR("%s: error object is null\n", __func__);
+                    }
                 }
+                fflush(stderr);
+                fflush(stdout);
                 GGML_ABORT("fatal error");
             }
         }
@@ -256,8 +265,17 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
             if (status != MTLCommandBufferStatusCompleted) {
                 GGML_LOG_ERROR("%s: error: command buffer %d failed with status %d\n", __func__, (int) i, (int) status);
                 if (status == MTLCommandBufferStatusError) {
-                    GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
+                    GGML_LOG_ERROR("%s: command buffer error B\n", __func__);
+                    NSError * err = [cmd_buf error];
+                    if (err) {
+                        GGML_LOG_ERROR("%s: error code: %d, domain: %s\n", __func__, (int) err.code, [err.domain UTF8String]);
+                        GGML_LOG_ERROR("%s: error description: %s\n", __func__, [err.localizedDescription UTF8String]);
+                    } else {
+                        GGML_LOG_ERROR("%s: error object is null\n", __func__);
+                    }
                 }
+                fflush(stderr);
+                fflush(stdout);
                 GGML_ABORT("fatal error");
             }
 
