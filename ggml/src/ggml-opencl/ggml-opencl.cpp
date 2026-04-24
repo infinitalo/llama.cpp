@@ -282,8 +282,14 @@ struct ggml_cl_buffer {
         : buffer(nullptr), size(0) {}
 
     ~ggml_cl_buffer() {
+        release();
+    }
+
+    void release() {
         if (buffer) {
             CL_CHECK(clReleaseMemObject(buffer));
+            buffer = nullptr;
+            size = 0;
         }
     }
 
@@ -719,6 +725,19 @@ struct ggml_backend_opencl_context {
             write_profiling_info();
             profiling_info.clear();
 #endif
+            // Release the shared prealloc buffers so their device memory
+            // (which is ratcheted up to the largest size ever requested)
+            // doesn't persist after the last backend has been freed.
+            prealloc_quant_trans.release();
+            prealloc_scales_trans.release();
+            prealloc_act_trans.release();
+            prealloc_src0.release();
+            prealloc_src1.release();
+
+            if (queue) {
+                CL_CHECK(clReleaseCommandQueue(queue));
+                queue = nullptr;
+            }
         }
     }
 };
