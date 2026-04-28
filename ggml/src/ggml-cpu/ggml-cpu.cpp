@@ -371,26 +371,9 @@ static void ggml_backend_cpu_device_get_memory(ggml_backend_dev_t dev, size_t * 
     long pages = sysconf(_SC_PHYS_PAGES);
     long page_size = sysconf(_SC_PAGE_SIZE);
     *total = pages * page_size;
-    *free = *total;
 
-#ifdef __linux__
-    // On Linux (incl. Android), /proc/meminfo MemAvailable is the kernel's
-    // own estimate of memory available for new allocations without swapping.
-    // This is the correct signal for deciding whether a load will fit,
-    // especially on UMA devices where GPU backends can't report free memory.
-    FILE * f = fopen("/proc/meminfo", "r");
-    if (f) {
-        char line[256];
-        while (fgets(line, sizeof(line), f)) {
-            size_t mem_avail_kb = 0;
-            if (sscanf(line, "MemAvailable: %zu kB", &mem_avail_kb) == 1) {
-                *free = mem_avail_kb * 1024;
-                break;
-            }
-        }
-        fclose(f);
-    }
-#endif // __linux__
+    // "free" system memory is ill-defined, for practical purposes assume that all of it is free:
+    *free = *total;
 #endif // _WIN32
 
     GGML_UNUSED(dev);
