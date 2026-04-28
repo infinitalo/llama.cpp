@@ -3,15 +3,23 @@
 // model: Llama-3.2-1B-Instruct-Q4_0.gguf
 // Usage:
 //   ./test-multi-instance-repro -m /path/to/model.gguf -ngl 999 -c 1024 -n 1
+//
+// Add --buffer-load to run Scenario 3: QVAC-style buffer load cycles.
+// Each cycle reads the file into a vector<uint8_t>, loads the model (moving
+// the buffer in), keeps a separate live copy of the raw bytes until after
+// inference (simulating Node.js GC not immediately collecting the JS wrapper),
+// then frees model+ctx first, then drops the raw copy.
 
 #include "arg.h"
 #include "common.h"
+#include "llama-cpp.h"
 #include "llama.h"
 #include "log.h"
 #include "sampling.h"
 
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -56,7 +64,35 @@ static bool decode_once(llama_context * ctx, const llama_model * model) {
     return llama_decode(ctx, batch) == 0;
 }
 
+static std::vector<uint8_t> read_file(const std::string & path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) {
+        fprintf(stderr, "failed to open %s\n", path.c_str());
+        return {};
+    }
+    const size_t sz = f.tellg();
+    f.seekg(0);
+    std::vector<uint8_t> buf(sz);
+    f.read(reinterpret_cast<char *>(buf.data()), sz);
+    return buf;
+}
+
 int main(int argc, char ** argv) {
+    // --buffer-load: opt-in to Scenario 3 (QVAC-style buffer load cycles).
+    // Strip it before handing argv to common_params_parse.
+    bool do_buffer_load = false;
+    {
+        int out = 1;
+        for (int i = 1; i < argc; ++i) {
+            if (strcmp(argv[i], "--buffer-load") == 0) {
+                do_buffer_load = true;
+            } else {
+                argv[out++] = argv[i];
+            }
+        }
+        argc = out;
+    }
+
     common_params params;
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
         return 1;
@@ -132,6 +168,72 @@ int main(int argc, char ** argv) {
         inst.reset();
         snprintf(label, sizeof(label), "S2 cycle %d after  unload", i);
         print_mem(label);
+    }
+
+    if (do_buffer_load) {
+        printf("\n=== Scenario 3: QVAC-style buffer load/unload cycles ===\n");
+        printf("    (file read -> model load -> context create -> decode -> free model+ctx -> drop raw bytes)\n\n");
+        constexpr int BL_CYCLES = 20;
+        for (int i = 1; i <= BL_CYCLES; ++i) {
+            char label[80];
+
+            // Step 1: read the whole file into memory (FilesystemDL equivalent)
+            std::vector<uint8_t> raw = read_file(params.model.path);
+            if (raw.empty()) {
+                fprintf(stderr, "S3: cycle %d failed to read file\n", i);
+                return 1;
+            }
+            snprintf(label, sizeof(label), "S3 cycle %d after  file read", i);
+            print_mem(label);
+            // Keep a second copy alive to simulate the JS wrapper holding the
+            // original allocation while llama.cpp moves it into the model.
+            std::vector<uint8_t> raw_copy = raw;
+
+            // Step 2: load model (moves raw; raw_copy lives on alongside model)
+            llama_model_params mparams = llama_model_default_params();
+            mparams.n_gpu_layers = params.n_gpu_layers >= 0 ? params.n_gpu_layers : 0;
+            mparams.use_mmap     = false;
+            llama_model * model = llama_model_load_from_buffer(std::move(raw), mparams);
+            if (!model) {
+                fprintf(stderr, "S3: cycle %d failed to load model\n", i);
+                return 1;
+            }
+            snprintf(label, sizeof(label), "S3 cycle %d after  model load", i);
+            print_mem(label);
+
+            // Step 3: create context
+            llama_context_params cparams = llama_context_default_params();
+            cparams.n_ctx   = params.n_ctx > 0 ? (uint32_t) params.n_ctx : 1024;
+            cparams.n_batch = 512;
+            llama_context * ctx = llama_init_from_model(model, cparams);
+            if (!ctx) {
+                fprintf(stderr, "S3: cycle %d failed to create context\n", i);
+                llama_model_free(model);
+                return 1;
+            }
+            snprintf(label, sizeof(label), "S3 cycle %d after  ctx create", i);
+            print_mem(label);
+
+            // Step 4: one decode (exercises GPU kernel launch + buffer use)
+            if (!decode_once(ctx, model)) {
+                fprintf(stderr, "S3: cycle %d decode failed (non-fatal)\n", i);
+            }
+            snprintf(label, sizeof(label), "S3 cycle %d after  decode", i);
+            print_mem(label);
+
+            // Step 5: free model+ctx synchronously (C++ side)
+            llama_free(ctx);
+            llama_model_free(model);
+            snprintf(label, sizeof(label), "S3 cycle %d after  free model+ctx", i);
+            print_mem(label);
+
+            // Step 6: drop the raw copy (simulates GC eventually collecting
+            // the JS wrapper that was keeping the file buffer alive)
+            raw_copy.clear();
+            raw_copy.shrink_to_fit();
+            snprintf(label, sizeof(label), "S3 cycle %d after  drop raw copy", i);
+            print_mem(label);
+        }
     }
 
     llama_backend_free();
