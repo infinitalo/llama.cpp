@@ -13,6 +13,13 @@
 
 #include "ggml-cpp.h"
 
+#ifdef __ANDROID__
+#include <android/log.h>
+#define ALOG_MODEL(...) __android_log_print(ANDROID_LOG_ERROR, "llama_debug", __VA_ARGS__)
+#else
+#define ALOG_MODEL(...) fprintf(stderr, __VA_ARGS__)
+#endif
+
 #ifdef __APPLE__
 #include <TargetConditionals.h>
 #endif
@@ -482,14 +489,14 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 }
 
 llama_model::~llama_model() {
-    LLAMA_LOG_INFO("[DEBUG] ~llama_model: ctxs_bufs.size()=%zu\n", pimpl->ctxs_bufs.size());
+    ALOG_MODEL("[MEMDBG] ~llama_model: ctxs_bufs.size()=%zu\n", pimpl->ctxs_bufs.size());
     {
         FILE * f = fopen("/proc/self/status", "r");
         if (f) {
             char line[128];
             while (fgets(line, sizeof(line), f)) {
                 if (strncmp(line, "VmRSS:", 6) == 0 || strncmp(line, "VmSwap:", 7) == 0) {
-                    LLAMA_LOG_INFO("[DEBUG] %s", line);
+                    ALOG_MODEL("[MEMDBG] %s", line);
                 }
             }
             fclose(f);

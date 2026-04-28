@@ -13,6 +13,13 @@
 #include "ggml-backend-impl.h"
 #include "ggml.h"
 
+#ifdef __ANDROID__
+#include <android/log.h>
+#define ALOG(...) __android_log_print(ANDROID_LOG_ERROR, "llama_debug", __VA_ARGS__)
+#else
+#define ALOG(...) fprintf(stderr, __VA_ARGS__)
+#endif
+
 #include <CL/cl.h>
 
 #include <inttypes.h>
@@ -4041,7 +4048,7 @@ struct ggml_backend_opencl_buffer_context {
 
 static void ggml_backend_opencl_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
-    GGML_LOG_INFO("[DEBUG] opencl buf FREE  cl_mem=%p size=%.2f MiB\n",
+    ALOG("[MEMDBG] opencl buf FREE  cl_mem=%p size=%.2f MiB\n",
         (void *)(ctx->buffer.empty() ? nullptr : ctx->buffer[0]),
         buffer->size / 1024.0 / 1024.0);
     delete ctx;
@@ -5188,7 +5195,7 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
     }
 
     ggml_backend_opencl_buffer_context * ctx = new ggml_backend_opencl_buffer_context(mem);
-    GGML_LOG_INFO("[DEBUG] opencl buf ALLOC cl_mem=%p size=%.2f MiB\n",
+    ALOG("[MEMDBG] opencl buf ALLOC cl_mem=%p size=%.2f MiB\n",
         (void *)mem, size / 1024.0 / 1024.0);
 
     return ggml_backend_buffer_init(buffer_type, ggml_backend_opencl_buffer_interface, ctx, size);
