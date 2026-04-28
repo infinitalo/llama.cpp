@@ -35,12 +35,13 @@ static void print_mem(const char * label) {
     long rss  = read_kb("VmRSS:");
     long size = read_kb("VmSize:");
     long peak = read_kb("VmPeak:");
+    long swap = read_kb("VmSwap:");
     if (rss < 0) {
         printf("[MEM] %-36s (no /proc/self/status)\n", label);
         return;
     }
-    printf("[MEM] %-36s RSS=%5ld MiB  VmSize=%5ld MiB  VmPeak=%5ld MiB\n",
-           label, rss / 1024, size / 1024, peak / 1024);
+    printf("[MEM] %-36s RSS=%5ld MiB  VmSize=%5ld MiB  VmPeak=%5ld MiB  VmSwap=%5ld MiB\n",
+           label, rss / 1024, size / 1024, peak / 1024, swap / 1024);
     fflush(stdout);
 }
 
