@@ -12089,6 +12089,7 @@ static void ggml_vk_add_id(ggml_backend_vk_context * ctx, vk_context& subctx, co
 }
 
 static void ggml_vk_mul_mat_id_back_a(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * grad_out, const ggml_tensor * b, const ggml_tensor * ids, ggml_tensor * dst) {
+    { static int n = 0; if (n++ < 8) fprintf(stderr, "[PROBE] MUL_MAT_ID_BACK_A dispatched on Vulkan: dst=[%ld,%ld,%ld] n_tok=%ld\n", (long)dst->ne[0], (long)dst->ne[1], (long)dst->ne[2], (long)ids->ne[1]); }
     const uint32_t g_type_size   = ggml_type_size(grad_out->type);
     const uint32_t b_type_size   = ggml_type_size(b->type);
     const uint32_t ids_type_size = ggml_type_size(ids->type);
@@ -12109,6 +12110,7 @@ static void ggml_vk_mul_mat_id_back_a(ggml_backend_vk_context * ctx, vk_context&
 }
 
 static void ggml_vk_mul_mat_id_back_b(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * as, const ggml_tensor * grad_out, const ggml_tensor * ids, ggml_tensor * dst) {
+    { static int n = 0; if (n++ < 8) fprintf(stderr, "[PROBE] MUL_MAT_ID_BACK_B dispatched on Vulkan: dst=[%ld,%ld,%ld] n_tok=%ld\n", (long)dst->ne[0], (long)dst->ne[1], (long)dst->ne[2], (long)ids->ne[1]); }
     const uint32_t as_type_size  = ggml_type_size(as->type);
     const uint32_t as_blck_size  = ggml_blck_size(as->type);
     const uint32_t g_type_size   = ggml_type_size(grad_out->type);
