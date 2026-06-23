@@ -12774,7 +12774,10 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size_t, local_work_size_t, dst);
 
         // gemm
-        kernel = backend_ctx->kernel_gemm_noshuffle_q8_0_f32;
+        // Use the tetherto-tuned 8x4 GEMM kernel rather than gemm_noshuffle_q8_0_f32:
+        // it is a drop-in (identical args + work sizes) but ~3.5x faster for q8_0
+        // prompt processing on Adreno. See the b9341 -> b9518 pp512 regression.
+        kernel = backend_ctx->kernel_mul_mm_q8_0_f32_8x4;
         int padded_N = N + padding;
 
         CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0_q8_0->q));
